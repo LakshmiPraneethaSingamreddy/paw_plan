@@ -10,25 +10,25 @@ PawPal+ provides an intuitive Streamlit interface for managing pet care across m
 
 **1. Owner Setup & Pet Management**  
 
-![Owner Setup & Pet Management](docs/images/01-owner-setup.png)
+![Owner Setup & Pet Management](assets/01-owner-setup.png)
 Set owner preferences, configure weekly availability windows, and add/manage multiple pets with detailed profiles.
 
 
 **2. Pet Setup** 
 
-![Pet Setup](docs/images/02-pet-setup.png)
+![Pet Setup](assets/02-pet-setup.png)
 Add, edit, and remove pets with profile details (name, species, age, height, and weight).
 
 
 **3. Task Creation & Management** 
 
-![Task Creation & Management](docs/images/03-task-management.png)
+![Task Creation & Management](assets/03-task-management.png)
 Create tasks with recurrence patterns (daily, weekly, custom), time windows, priorities, and flexibility. View, filter, and edit tasks in a structured table.
 
 
 **4. Intelligent Daily Scheduling & Explanations** 
 
-![Daily Scheduling & Explanations](docs/images/04-schedule-and-explanations.png)
+![Daily Scheduling & Explanations](assets/04-schedule-and-explanations.png)
 Generate daily schedules, track completion, detect conflicts, and review plan explanations for why tasks were placed, deferred, or skipped.
 
 ## Features
