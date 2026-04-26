@@ -333,6 +333,22 @@ class AgentTelemetry:
 	used_deterministic_fallback: bool = False
 
 
+@dataclass
+class OrchestrationRetryConfig:
+	"""Retry policy and stop conditions for planning orchestration."""
+	max_retries: int = AGENT_RETRY_BUDGET
+	stop_on_severities: tuple[ViolationSeverity, ...] = (ViolationSeverity.CRITICAL,)
+	fallback_on_validation_failure: bool = True
+
+
+@dataclass
+class PlanningContext:
+	"""Context assembled once per planning request for agent orchestration."""
+	owner_id: UUID
+	owner: Owner
+	schedule_date: date
+
+
 def _is_within_availability(item: ScheduleItem, day_windows: list[AvailabilityWindow]) -> bool:
 	"""Return whether a scheduled item is fully inside at least one day window."""
 	if item.start_time is None or item.end_time is None:
@@ -1404,6 +1420,116 @@ class PetCareApp:
 		self.owners_by_id: dict[UUID, Owner] = {}
 		self.schedules_by_owner_date: dict[tuple[UUID, date], DailySchedule] = {}
 		self.task_completion_by_owner_date: dict[tuple[UUID, date, UUID], datetime | None] = {}
+		self.planning_retry_config = OrchestrationRetryConfig()
+		self.planning_telemetry_by_owner_date: dict[tuple[UUID, date], list[AgentTelemetry]] = {}
+		self.planning_logs_by_owner_date: dict[tuple[UUID, date], list[str]] = {}
+
+	def _build_planning_context(self, owner_id: UUID, owner: Owner, schedule_date: date) -> PlanningContext:
+		"""Build deterministic planning context for the orchestration loop."""
+		return PlanningContext(owner_id=owner_id, owner=owner, schedule_date=schedule_date)
+
+	def _run_scheduler_agent_wrapper(
+		self,
+		context: PlanningContext,
+	) -> tuple[ScheduleCandidate, DailySchedule, int]:
+		"""Scheduler Agent wrapper that currently delegates to scheduler service."""
+		started_at = datetime.utcnow()
+		baseline_schedule = self.scheduler_service.generate_daily_schedule(context.owner, context.schedule_date)
+		duration_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+		candidate = ScheduleCandidate(
+			proposed_items=list(baseline_schedule.items),
+			objective_score=float(len(baseline_schedule.items)),
+			rationale_summary="Delegated to SchedulerService for deterministic baseline candidate.",
+			generated_by=AgentRole.SCHEDULER,
+			advisory_only=AGENT_OUTPUTS_ADVISORY_ONLY,
+		)
+		return candidate, baseline_schedule, duration_ms
+
+	def _should_stop_retry(self, result: ValidationResult) -> bool:
+		"""Return True when retry loop should stop after a failed validation."""
+		if not result.repair_hints:
+			return True
+		return any(
+			violation.severity in self.planning_retry_config.stop_on_severities
+			for violation in result.violations
+		)
+
+	def _orchestrate_daily_planning(self, owner_id: UUID, owner: Owner, schedule_date: date) -> DailySchedule:
+		"""Run the phase-1 orchestration loop around existing scheduler behavior."""
+		context = self._build_planning_context(owner_id=owner_id, owner=owner, schedule_date=schedule_date)
+		telemetry_entries: list[AgentTelemetry] = []
+		loop_logs: list[str] = []
+
+		for attempt in range(self.planning_retry_config.max_retries + 1):
+			candidate, baseline_schedule, duration_ms = self._run_scheduler_agent_wrapper(context)
+			validation_result = validate_schedule_candidate(candidate, owner, schedule_date)
+
+			if validation_result.passed:
+				loop_logs.append(
+					f"Iteration {attempt + 1}: candidate passed validation and was accepted."
+				)
+				telemetry_entries.append(
+					AgentTelemetry(
+						agent_role=AgentRole.SCHEDULER,
+						retries=attempt,
+						duration_ms=duration_ms,
+					)
+				)
+				self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
+				self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
+				return baseline_schedule
+
+			violation_codes = ", ".join(v.code for v in validation_result.violations) or "UNKNOWN"
+			loop_logs.append(
+				f"Iteration {attempt + 1}: candidate failed validation with violations [{violation_codes}]."
+			)
+
+			exhausted_retries = attempt >= self.planning_retry_config.max_retries
+			stop_retry = self._should_stop_retry(validation_result)
+			use_fallback = self.planning_retry_config.fallback_on_validation_failure and (exhausted_retries or stop_retry)
+
+			fallback_reason = ""
+			if use_fallback:
+				if exhausted_retries:
+					fallback_reason = "max_retries_exhausted"
+				elif stop_retry:
+					fallback_reason = "stop_condition_triggered"
+				loop_logs.append(
+					f"Iteration {attempt + 1}: deterministic fallback triggered ({fallback_reason})."
+				)
+
+			telemetry_entries.append(
+				AgentTelemetry(
+					agent_role=AgentRole.SCHEDULER,
+					retries=attempt,
+					fallback_reason=fallback_reason,
+					duration_ms=duration_ms,
+					used_deterministic_fallback=use_fallback,
+				)
+			)
+
+			if use_fallback:
+				fallback_schedule = self.scheduler_service.generate_daily_schedule(owner, schedule_date)
+				self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
+				self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
+				return fallback_schedule
+
+			loop_logs.append(f"Iteration {attempt + 1}: retry scheduled.")
+
+		# Defensive fallback; loop should always return before this line.
+		fallback_schedule = self.scheduler_service.generate_daily_schedule(owner, schedule_date)
+		telemetry_entries.append(
+			AgentTelemetry(
+				agent_role=AgentRole.SCHEDULER,
+				retries=self.planning_retry_config.max_retries,
+				fallback_reason="defensive_fallback_after_loop",
+				used_deterministic_fallback=True,
+			)
+		)
+		loop_logs.append("Deterministic fallback triggered after loop completion.")
+		self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
+		self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
+		return fallback_schedule
 
 	def create_owner_profile(self) -> Owner:
 		"""Create a new owner profile and register it with the application.
@@ -1458,7 +1584,7 @@ class PetCareApp:
 		# Preserve completion state for tasks that remain after regeneration.
 		previous_schedule = self.schedules_by_owner_date.get((owner_id, schedule_date))
 
-		schedule = self.scheduler_service.generate_daily_schedule(owner, schedule_date)
+		schedule = self._orchestrate_daily_planning(owner_id=owner_id, owner=owner, schedule_date=schedule_date)
 
 		if previous_schedule is not None:
 			for previous_item in previous_schedule.items:
