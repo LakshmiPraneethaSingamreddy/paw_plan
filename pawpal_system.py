@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 
@@ -67,6 +67,58 @@ class ScheduleStatus(Enum):
 	DRAFT = "Draft"
 	FINAL = "Final"
 	UPDATED = "Updated"
+
+
+class AgentRole(Enum):
+	"""Roles used by the multi-agent planning architecture."""
+	SCHEDULER = "SchedulerAgent"
+	EXPLANATION = "ExplanationAgent"
+	TASK_MANAGEMENT = "TaskManagementAgent"
+
+
+class ViolationSeverity(Enum):
+	"""Severity levels for validation violations."""
+	LOW = "low"
+	MEDIUM = "medium"
+	HIGH = "high"
+	CRITICAL = "critical"
+
+
+# Phase 0 architecture contract: each role has one clear boundary.
+AGENT_ROLE_RESPONSIBILITIES: dict[AgentRole, tuple[str, ...]] = {
+	AgentRole.SCHEDULER: (
+		"Proposes a schedule candidate for the requested day.",
+		"Does not mutate owner/task persistence state.",
+	),
+	AgentRole.EXPLANATION: (
+		"Explains why the candidate is valid and preferred.",
+		"References constraints, ordering, and tradeoffs used in planning.",
+	),
+	AgentRole.TASK_MANAGEMENT: (
+		"Validates pet/task payloads before persistence.",
+		"Repairs malformed payloads using deterministic repair hints.",
+	),
+}
+
+# Non-negotiable guardrails for all planning outcomes.
+HARD_CONSTRAINT_RULES: tuple[str, ...] = (
+	"No overlap in final schedule.",
+	"Non-flexible tasks must satisfy earliest_start/latest_end windows.",
+	"Owner availability windows must be honored.",
+	"Use bounded retries, then deterministic fallback.",
+)
+
+# Deterministic policy baseline for all agentized scheduling flows.
+AGENT_RETRY_BUDGET = 2
+DETERMINISTIC_FALLBACK_POLICY = (
+	"Retry each agent invocation up to AGENT_RETRY_BUDGET times. "
+	"If validation still fails, bypass advisory candidate and return the schedule "
+	"from SchedulerService.generate_daily_schedule as the final authority."
+)
+
+# Source of truth contract: existing scheduler remains authoritative.
+SCHEDULE_SOURCE_OF_TRUTH = "SchedulerService.generate_daily_schedule"
+AGENT_OUTPUTS_ADVISORY_ONLY = True
 
 
 @dataclass
@@ -225,6 +277,153 @@ class ScheduleItem:
 		"""Mark this schedule item as not completed."""
 		self.completed = False
 		self.completed_at = None
+
+
+@dataclass
+class ScheduleCandidate:
+	"""Advisory schedule output produced by the Scheduler Agent.
+
+	This candidate is never considered final until it passes validation.
+	"""
+	candidate_id: UUID = field(default_factory=uuid4)
+	proposed_items: list[ScheduleItem] = field(default_factory=list)
+	objective_score: float = 0.0
+	rationale_summary: str = ""
+	generated_by: AgentRole = AgentRole.SCHEDULER
+	advisory_only: bool = True
+
+
+@dataclass
+class ValidationViolation:
+	"""Single guardrail violation discovered during validation."""
+	code: str = ""
+	message: str = ""
+	severity: ViolationSeverity = ViolationSeverity.MEDIUM
+	repair_hint: str = ""
+
+
+@dataclass
+class ValidationResult:
+	"""Validation output for agent-produced payloads and schedule candidates."""
+	status: Literal["pass", "fail"] = "pass"
+	violations: list[ValidationViolation] = field(default_factory=list)
+	repair_hints: list[str] = field(default_factory=list)
+
+	def add_violation(self, violation: ValidationViolation) -> None:
+		"""Append a violation and flip result status to fail."""
+		self.violations.append(violation)
+		if violation.repair_hint:
+			self.repair_hints.append(violation.repair_hint)
+		self.status = "fail"
+
+	@property
+	def passed(self) -> bool:
+		"""Convenience pass/fail accessor for call sites."""
+		return self.status == "pass"
+
+
+@dataclass
+class AgentTelemetry:
+	"""Execution telemetry for one agent run."""
+	run_id: UUID = field(default_factory=uuid4)
+	agent_role: AgentRole = AgentRole.SCHEDULER
+	retries: int = 0
+	fallback_reason: str = ""
+	duration_ms: int = 0
+	used_deterministic_fallback: bool = False
+
+
+def _is_within_availability(item: ScheduleItem, day_windows: list[AvailabilityWindow]) -> bool:
+	"""Return whether a scheduled item is fully inside at least one day window."""
+	if item.start_time is None or item.end_time is None:
+		return False
+
+	for window in day_windows:
+		start_t = window.start_time or time(hour=0, minute=0)
+		end_t = window.end_time or time(hour=23, minute=59)
+		window_start = datetime.combine(item.start_time.date(), start_t)
+		window_end = datetime.combine(item.start_time.date(), end_t)
+		if item.start_time >= window_start and item.end_time <= window_end:
+			return True
+
+	return False
+
+
+def validate_schedule_candidate(
+	candidate: ScheduleCandidate,
+	owner: Owner,
+	schedule_date: date,
+) -> ValidationResult:
+	"""Validate advisory schedule candidate against Phase 0 hard constraints."""
+	result = ValidationResult()
+	day_windows = [
+		window
+		for window in owner.availability_windows
+		if window.day_of_week == schedule_date.weekday()
+	]
+
+	items = [
+		item
+		for item in candidate.proposed_items
+		if item.start_time is not None and item.end_time is not None
+	]
+	items.sort(key=lambda scheduled_item: scheduled_item.start_time)
+
+	for previous_item, current_item in zip(items, items[1:]):
+		if previous_item.end_time > current_item.start_time:
+			result.add_violation(
+				ValidationViolation(
+					code="NO_OVERLAP",
+					message="Final schedule contains overlapping tasks.",
+					severity=ViolationSeverity.CRITICAL,
+					repair_hint="Shift or remove lower-priority flexible tasks to remove overlap.",
+				)
+			)
+
+	for item in items:
+		task = item.task
+		if task is None:
+			result.add_violation(
+				ValidationViolation(
+					code="MISSING_TASK",
+					message="Schedule item is missing task metadata.",
+					severity=ViolationSeverity.HIGH,
+					repair_hint="Hydrate schedule items with full task references before validation.",
+				)
+			)
+			continue
+
+		if not task.is_flexible:
+			if task.earliest_start is not None and item.start_time.time() < task.earliest_start:
+				result.add_violation(
+					ValidationViolation(
+						code="RIGID_START_WINDOW",
+						message=f"Non-flexible task '{task.title}' starts before earliest_start.",
+						severity=ViolationSeverity.CRITICAL,
+						repair_hint="Move rigid task to begin at or after earliest_start.",
+					)
+				)
+			if task.latest_end is not None and item.end_time.time() > task.latest_end:
+				result.add_violation(
+					ValidationViolation(
+						code="RIGID_END_WINDOW",
+						message=f"Non-flexible task '{task.title}' ends after latest_end.",
+						severity=ViolationSeverity.CRITICAL,
+						repair_hint="Move rigid task to end by latest_end or remove conflicting tasks.",
+					)
+				)
+
+		if not _is_within_availability(item, day_windows):
+			result.add_violation(
+				ValidationViolation(
+					code="OUTSIDE_AVAILABILITY",
+					message=f"Task '{task.title}' falls outside owner availability windows.",
+					severity=ViolationSeverity.HIGH,
+					repair_hint="Reslot task inside configured weekday availability windows.",
+				)
+			)
+
+	return result
 
 
 @dataclass

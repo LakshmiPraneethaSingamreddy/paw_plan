@@ -33,6 +33,55 @@ Generate daily schedules, track completion, detect conflicts, and review plan ex
 
 ## Features
 
+## Phase 0: Architecture Contracts and Safety Baseline
+
+This section defines the non-negotiable architecture contract before agent orchestration is introduced.
+
+### Agent roles and responsibilities
+
+1. **Scheduler Agent**
+   - Proposes a `ScheduleCandidate` for the requested day.
+   - Does not mutate persisted owner/pet/task state.
+
+2. **Explanation Agent**
+   - Explains why a candidate is valid and why it was chosen.
+   - References ordering, constraints, and tradeoffs.
+
+3. **Task Management Agent**
+   - Validates incoming pet/task payloads prior to persistence.
+   - Repairs malformed inputs using deterministic repair hints.
+
+### Shared schemas
+
+1. **`ScheduleCandidate`**
+   - `candidate_id`, `proposed_items`, `objective_score`, `rationale_summary`, `generated_by`, `advisory_only`
+
+2. **`ValidationResult`**
+   - `status` (`pass` / `fail`)
+   - `violations` (each with code, message, severity, and repair hint)
+   - `repair_hints` (aggregated deterministic guidance)
+
+3. **`AgentTelemetry`**
+   - `run_id`, `agent_role`, `retries`, `fallback_reason`, `duration_ms`, `used_deterministic_fallback`
+
+### Hard constraints (guardrails)
+
+1. No overlap in final schedule.
+2. Non-flexible tasks must satisfy task time windows.
+3. Owner availability windows must be honored.
+4. Retry budget must be enforced with deterministic fallback.
+
+### Deterministic source of truth
+
+1. Existing scheduler logic (`SchedulerService.generate_daily_schedule`) remains the final authority.
+2. Agent outputs are advisory only until validated.
+
+### Deterministic fallback policy
+
+1. Retry each agent call up to a fixed budget (`AGENT_RETRY_BUDGET = 2`).
+2. If validation still fails, bypass advisory agent output.
+3. Use deterministic scheduler output as the final returned schedule.
+
 ### Product capabilities
 
 1. **Owner + pet profile management**
