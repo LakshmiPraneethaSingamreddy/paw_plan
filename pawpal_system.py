@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 
@@ -289,6 +289,9 @@ class ScheduleCandidate:
 	proposed_items: list[ScheduleItem] = field(default_factory=list)
 	objective_score: float = 0.0
 	rationale_summary: str = ""
+	rationale_metadata: dict[str, Any] = field(default_factory=dict)
+	planning_summary_metadata: dict[str, Any] = field(default_factory=dict)
+	reason_codes: tuple[str, ...] = ()
 	generated_by: AgentRole = AgentRole.SCHEDULER
 	advisory_only: bool = True
 
@@ -320,6 +323,17 @@ class ValidationResult:
 	def passed(self) -> bool:
 		"""Convenience pass/fail accessor for call sites."""
 		return self.status == "pass"
+
+
+class TaskValidationError(ValueError):
+	"""Raised when task payload guardrails fail during add/edit persistence."""
+
+	def __init__(self, result: ValidationResult):
+		self.result = result
+		messages = "; ".join(violation.message for violation in result.violations) or "Task validation failed."
+		suggestions = " | ".join(result.repair_hints)
+		combined = messages if not suggestions else f"{messages} Suggestions: {suggestions}"
+		super().__init__(combined)
 
 
 @dataclass
@@ -465,6 +479,7 @@ class DailySchedule:
 	created_at: datetime = field(default_factory=datetime.utcnow)
 	items: list[ScheduleItem] = field(default_factory=list)
 	explanations: list[PlanExplanation] = field(default_factory=list)
+	planning_metadata: dict[str, Any] = field(default_factory=dict)
 
 	def regenerate(self) -> None:
 		"""Rebuild this schedule from current tasks and constraints.
@@ -641,6 +656,278 @@ class SchedulingConstraint:
 		return True
 
 
+class TaskManagementAgent:
+	"""Validates task payloads before persistence and emits deterministic repair hints."""
+
+	DEFAULT_REPAIR_DURATION_MIN = 15
+
+	def validate_task_payload(
+		self,
+		owner: "Owner",
+		pet_id: UUID,
+		task: CareTask,
+		existing_task_id: UUID | None = None,
+	) -> ValidationResult:
+		"""Validate a task payload for add/edit operations.
+
+		Rules enforced in Phase 2:
+		- Duration must be positive.
+		- latest_end must be after earliest_start.
+		- Recurrence schema must be coherent.
+		- Duplicate/contradictory tasks are rejected.
+		"""
+		result = ValidationResult()
+
+		self._validate_duration(task, result)
+		self._validate_time_window(task, result)
+		self._validate_recurrence(task, result)
+		self._validate_duplicate_or_contradictory(owner, pet_id, task, existing_task_id, result)
+
+		return result
+
+	def _validate_duration(self, task: CareTask, result: ValidationResult) -> None:
+		if task.duration_min > 0:
+			return
+
+		result.add_violation(
+			ValidationViolation(
+				code="INVALID_DURATION",
+				message="Task duration must be a positive number of minutes.",
+				severity=ViolationSeverity.HIGH,
+				repair_hint=(
+					f"Set duration_min to at least {self.DEFAULT_REPAIR_DURATION_MIN} minutes."
+				),
+			)
+		)
+
+	def _validate_time_window(self, task: CareTask, result: ValidationResult) -> None:
+		if task.earliest_start is None or task.latest_end is None:
+			return
+
+		if task.latest_end > task.earliest_start:
+			return
+
+		suggested_end = self._suggest_nearest_valid_end(task.earliest_start, task.duration_min)
+		result.add_violation(
+			ValidationViolation(
+				code="INVALID_TIME_WINDOW",
+				message="Task latest_end must be after earliest_start.",
+				severity=ViolationSeverity.HIGH,
+				repair_hint=(
+					f"Set latest_end to {suggested_end.strftime('%H:%M')} or later "
+					f"for earliest_start {task.earliest_start.strftime('%H:%M')}."
+				),
+			)
+		)
+
+	def _validate_recurrence(self, task: CareTask, result: ValidationResult) -> None:
+		if task.frequency == Frequency.DAILY:
+			if (
+				task.weekly_day_of_week is not None
+				or task.custom_days_of_week
+				or task.custom_interval_days is not None
+				or task.custom_anchor_date is not None
+			):
+				result.add_violation(
+					ValidationViolation(
+						code="INCOHERENT_RECURRENCE_DAILY",
+						message="Daily recurrence cannot include weekly/custom recurrence fields.",
+						severity=ViolationSeverity.MEDIUM,
+						repair_hint=(
+							"Normalize recurrence by clearing weekly_day_of_week, custom_days_of_week, "
+							"custom_interval_days, and custom_anchor_date."
+						),
+					)
+				)
+			return
+
+		if task.frequency == Frequency.WEEKLY:
+			if task.weekly_day_of_week is None or not 0 <= task.weekly_day_of_week <= 6:
+				suggested_day = task.created_on.weekday()
+				result.add_violation(
+					ValidationViolation(
+						code="INCOHERENT_RECURRENCE_WEEKLY_DAY",
+						message="Weekly recurrence requires weekly_day_of_week in range 0..6.",
+						severity=ViolationSeverity.HIGH,
+						repair_hint=f"Set weekly_day_of_week to {suggested_day}.",
+					)
+				)
+
+			if (
+				task.custom_days_of_week
+				or task.custom_interval_days is not None
+				or task.custom_anchor_date is not None
+			):
+				result.add_violation(
+					ValidationViolation(
+						code="INCOHERENT_RECURRENCE_WEEKLY_EXTRA",
+						message="Weekly recurrence cannot include custom recurrence fields.",
+						severity=ViolationSeverity.MEDIUM,
+						repair_hint=(
+							"Normalize recurrence by clearing custom_days_of_week, "
+							"custom_interval_days, and custom_anchor_date."
+						),
+					)
+				)
+			return
+
+		if task.frequency == Frequency.CUSTOM:
+			has_days_mode = bool(task.custom_days_of_week)
+			has_interval_mode = task.custom_interval_days is not None or task.custom_anchor_date is not None
+
+			if task.custom_days_of_week and any(day < 0 or day > 6 for day in task.custom_days_of_week):
+				result.add_violation(
+					ValidationViolation(
+						code="INCOHERENT_RECURRENCE_CUSTOM_DAY_RANGE",
+						message="Custom weekday recurrence must use weekday values in range 0..6.",
+						severity=ViolationSeverity.HIGH,
+						repair_hint="Use weekday values Monday=0 through Sunday=6.",
+					)
+				)
+
+			if task.custom_interval_days is not None and task.custom_interval_days <= 0:
+				result.add_violation(
+					ValidationViolation(
+						code="INCOHERENT_RECURRENCE_CUSTOM_INTERVAL",
+						message="Custom interval recurrence must use a positive custom_interval_days value.",
+						severity=ViolationSeverity.HIGH,
+						repair_hint="Set custom_interval_days to at least 1.",
+					)
+				)
+
+			if has_days_mode and has_interval_mode:
+				result.add_violation(
+					ValidationViolation(
+						code="INCOHERENT_RECURRENCE_CUSTOM_MODE",
+						message="Custom recurrence cannot use both weekday and interval modes at the same time.",
+						severity=ViolationSeverity.HIGH,
+						repair_hint=(
+							"Choose one mode: keep custom_days_of_week or keep "
+							"custom_interval_days/custom_anchor_date, then clear the other mode."
+						),
+					)
+				)
+			elif not has_days_mode and not has_interval_mode:
+				result.add_violation(
+					ValidationViolation(
+						code="INCOHERENT_RECURRENCE_CUSTOM_MISSING",
+						message="Custom recurrence requires either weekday mode or interval mode.",
+						severity=ViolationSeverity.HIGH,
+						repair_hint=(
+							"Set custom_days_of_week (for selected weekdays) or set both "
+							"custom_interval_days and custom_anchor_date (for every N days)."
+						),
+					)
+				)
+
+			if task.custom_interval_days is not None and task.custom_anchor_date is None:
+				result.add_violation(
+					ValidationViolation(
+						code="INCOHERENT_RECURRENCE_CUSTOM_ANCHOR",
+						message="Custom interval recurrence requires a custom_anchor_date.",
+						severity=ViolationSeverity.MEDIUM,
+						repair_hint=(
+							f"Set custom_anchor_date to task created_on ({task.created_on.isoformat()}) "
+							"or another intended anchor date."
+						),
+					)
+				)
+
+			if task.custom_anchor_date is not None and task.custom_interval_days is None:
+				result.add_violation(
+					ValidationViolation(
+						code="INCOHERENT_RECURRENCE_CUSTOM_INTERVAL_MISSING",
+						message="Custom anchor_date requires custom_interval_days for interval mode.",
+						severity=ViolationSeverity.MEDIUM,
+						repair_hint="Set custom_interval_days to at least 1 when using custom_anchor_date.",
+					)
+				)
+			return
+
+	def _validate_duplicate_or_contradictory(
+		self,
+		owner: "Owner",
+		pet_id: UUID,
+		task: CareTask,
+		existing_task_id: UUID | None,
+		result: ValidationResult,
+	) -> None:
+		pet = owner._get_pet_by_id(pet_id)
+		if pet is None:
+			result.add_violation(
+				ValidationViolation(
+					code="PET_NOT_FOUND",
+					message="Target pet not found while validating task payload.",
+					severity=ViolationSeverity.CRITICAL,
+					repair_hint="Retry with a valid pet_id owned by the current owner.",
+				)
+			)
+			return
+
+		normalized_title = task.title.strip().lower()
+		for existing in pet.tasks:
+			if existing_task_id is not None and existing.task_id == existing_task_id:
+				continue
+
+			is_same_title = existing.title.strip().lower() == normalized_title and normalized_title != ""
+			is_same_signature = (
+				is_same_title
+				and existing.category == task.category
+				and existing.duration_min == task.duration_min
+				and existing.frequency == task.frequency
+				and existing.earliest_start == task.earliest_start
+				and existing.latest_end == task.latest_end
+				and existing.weekly_day_of_week == task.weekly_day_of_week
+				and existing.custom_days_of_week == task.custom_days_of_week
+				and existing.custom_interval_days == task.custom_interval_days
+				and existing.custom_anchor_date == task.custom_anchor_date
+			)
+
+			if is_same_signature:
+				result.add_violation(
+					ValidationViolation(
+						code="DUPLICATE_TASK",
+						message=(
+							f"Task duplicates existing task '{existing.title}' for this pet."
+						),
+						severity=ViolationSeverity.HIGH,
+						repair_hint=(
+							f"Merge with existing task {existing.task_id} or edit that task instead of creating a duplicate."
+						),
+					)
+				)
+				continue
+
+			if is_same_title and (
+				existing.frequency != task.frequency
+				or existing.category != task.category
+				or existing.earliest_start != task.earliest_start
+				or existing.latest_end != task.latest_end
+			):
+				result.add_violation(
+					ValidationViolation(
+						code="CONTRADICTORY_TASK",
+						message=(
+							f"Task may contradict existing task '{existing.title}' for this pet "
+							"(same title, conflicting recurrence/category/time window)."
+						),
+						severity=ViolationSeverity.MEDIUM,
+						repair_hint=(
+							f"Normalize recurrence/time fields and merge with task {existing.task_id} if it is the same routine."
+						),
+					)
+				)
+
+	def _suggest_nearest_valid_end(self, earliest_start: time, duration_min: int) -> time:
+		duration = duration_min if duration_min > 0 else self.DEFAULT_REPAIR_DURATION_MIN
+		base_dt = datetime.combine(date.today(), earliest_start)
+		suggested = base_dt + timedelta(minutes=duration)
+		end_of_day = datetime.combine(date.today(), time(hour=23, minute=59))
+		if suggested > end_of_day:
+			suggested = end_of_day
+		return suggested.time()
+
+
 @dataclass
 class Owner:
 	"""A pet owner and their associated pets and scheduling information.
@@ -718,6 +1005,16 @@ class Owner:
 			raise ValueError("Pet not found")
 		if task.task_id in self.task_to_pet:
 			raise ValueError("Task with this ID already exists")
+
+		validation_result = TaskManagementAgent().validate_task_payload(
+			owner=self,
+			pet_id=pet_id,
+			task=task,
+			existing_task_id=None,
+		)
+		if not validation_result.passed:
+			raise TaskValidationError(validation_result)
+
 		pet.tasks.append(task)
 		self.task_to_pet[task.task_id] = pet_id
 
@@ -742,11 +1039,24 @@ class Owner:
 
 		for task in pet.tasks:
 			if task.task_id == task_id:
+				candidate_task = replace(task)
 				for field_name, field_value in changes.items():
 					if field_name == "task_id":
 						raise ValueError("task_id cannot be edited")
-					if not hasattr(task, field_name):
+					if not hasattr(candidate_task, field_name):
 						raise AttributeError(f"Unknown task field: {field_name}")
+					setattr(candidate_task, field_name, field_value)
+
+				validation_result = TaskManagementAgent().validate_task_payload(
+					owner=self,
+					pet_id=pet_id,
+					task=candidate_task,
+					existing_task_id=task_id,
+				)
+				if not validation_result.passed:
+					raise TaskValidationError(validation_result)
+
+				for field_name, field_value in changes.items():
 					setattr(task, field_name, field_value)
 				return
 
@@ -822,6 +1132,27 @@ class SchedulerService:
 		"""
 		self.constraints = constraints or []
 		self.explanations_by_schedule_id: dict[UUID, list[PlanExplanation]] = {}
+
+	def _build_item_reason_code(
+		self,
+		decision_reason: str,
+		removed_tasks: list[ScheduleItem],
+		deferred_tasks: list[ScheduleItem],
+	) -> str:
+		"""Return a machine-readable reason code for a placement decision."""
+		if removed_tasks:
+			return "PLACED_WITH_BACKTRACK_REMOVE"
+		if deferred_tasks:
+			return "PLACED_WITH_DEFERRAL"
+
+		reason_lower = decision_reason.lower()
+		if "after deadline" in reason_lower:
+			return "PLACED_FLEX_AFTER_DEADLINE"
+		if "first open gap" in reason_lower:
+			return "PLACED_FIRST_OPEN_GAP"
+		if "after" in reason_lower and "finished" in reason_lower:
+			return "PLACED_AFTER_BLOCKING_TASK"
+		return "PLACED_EARLIEST_FEASIBLE"
 
 	def _should_include_task_for_date(self, task: CareTask, schedule_date: date) -> bool:
 		"""Return whether this task recurs on the given schedule date."""
@@ -917,6 +1248,14 @@ class SchedulerService:
 					impact_score=1.0,
 				)
 			]
+			schedule.planning_metadata = {
+				"scheduled_count": 0,
+				"recurrence_skipped_count": 0,
+				"unscheduled_count": 0,
+				"ordering_policy": "non_flexible_then_priority_then_deadline",
+				"strategy": "defer_flexible_then_remove_lower_priority_rigid",
+				"reason_codes": ["NO_AVAILABILITY_WINDOWS"],
+			}
 			self.explanations_by_schedule_id[schedule.schedule_id] = schedule.explanations
 			return schedule
 
@@ -943,6 +1282,7 @@ class SchedulerService:
 		candidate_pairs.sort(key=ordering_key)
 
 		explanations: list[PlanExplanation] = []
+		reason_codes_used: set[str] = set()
 		skipped_count = 0
 		for pet_id, task in candidate_pairs:
 			slot, decision_reason, removed_tasks, deferred_tasks = self._try_schedule_with_backtracking(
@@ -950,6 +1290,7 @@ class SchedulerService:
 			)
 			if slot is None:
 				skipped_count += 1
+				reason_codes_used.add("TASK_SKIPPED_NO_FEASIBLE_SLOT")
 				explanations.append(
 					PlanExplanation(
 						message=(
@@ -963,11 +1304,17 @@ class SchedulerService:
 				continue
 
 			start_dt, end_dt = slot
+			reason_code = self._build_item_reason_code(
+				decision_reason=decision_reason,
+				removed_tasks=removed_tasks,
+				deferred_tasks=deferred_tasks,
+			)
+			reason_codes_used.add(reason_code)
 			schedule.items.append(
 				ScheduleItem(
 					start_time=start_dt,
 					end_time=end_dt,
-					reason_code=decision_reason,
+					reason_code=reason_code,
 					task=task,
 					pet_id=pet_id,
 				)
@@ -1024,6 +1371,17 @@ class SchedulerService:
 				impact_score=1.0,
 			),
 		)
+		if recurrence_skipped > 0:
+			reason_codes_used.add("RECURRENCE_FILTERED_OUT")
+
+		schedule.planning_metadata = {
+			"scheduled_count": len(schedule.items),
+			"recurrence_skipped_count": recurrence_skipped,
+			"unscheduled_count": skipped_count,
+			"ordering_policy": "non_flexible_then_priority_then_deadline",
+			"strategy": "defer_flexible_then_remove_lower_priority_rigid",
+			"reason_codes": sorted(reason_codes_used),
+		}
 		schedule.explanations = explanations
 		self.explanations_by_schedule_id[schedule.schedule_id] = explanations
 		return schedule
@@ -1402,6 +1760,56 @@ class SchedulerService:
 		return conflicts
 
 
+@dataclass
+class SchedulerAgentOutput:
+	"""Output contract for scheduler agent invocations."""
+	candidate: ScheduleCandidate
+	baseline_schedule: DailySchedule
+	duration_ms: int
+
+
+class SchedulerAgent(Protocol):
+	"""Scheduler Agent interface for proposing schedule candidates."""
+
+	def propose_candidate(self, context: PlanningContext) -> SchedulerAgentOutput:
+		"""Return advisory candidate plus deterministic baseline schedule."""
+
+
+class DeterministicSchedulerAgent:
+	"""Engine-first Scheduler Agent backed by deterministic planning logic."""
+
+	def __init__(self, scheduler_service: SchedulerService) -> None:
+		self.scheduler_service = scheduler_service
+
+	def propose_candidate(self, context: PlanningContext) -> SchedulerAgentOutput:
+		started_at = datetime.utcnow()
+		baseline_schedule = self.scheduler_service.generate_daily_schedule(context.owner, context.schedule_date)
+		duration_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+
+		reason_codes = tuple(
+			baseline_schedule.planning_metadata.get("reason_codes", [])
+		)
+		candidate = ScheduleCandidate(
+			proposed_items=list(baseline_schedule.items),
+			objective_score=float(len(baseline_schedule.items)),
+			rationale_summary="Delegated to SchedulerService for deterministic baseline candidate.",
+			rationale_metadata={
+				"source_of_truth": SCHEDULE_SOURCE_OF_TRUTH,
+				"fallback_policy": DETERMINISTIC_FALLBACK_POLICY,
+				"hard_constraint_rules": list(HARD_CONSTRAINT_RULES),
+			},
+			planning_summary_metadata=dict(baseline_schedule.planning_metadata),
+			reason_codes=reason_codes,
+			generated_by=AgentRole.SCHEDULER,
+			advisory_only=AGENT_OUTPUTS_ADVISORY_ONLY,
+		)
+		return SchedulerAgentOutput(
+			candidate=candidate,
+			baseline_schedule=baseline_schedule,
+			duration_ms=duration_ms,
+		)
+
+
 class PetCareApp:
 	"""Main application for managing pet care and scheduling.
 	
@@ -1417,6 +1825,7 @@ class PetCareApp:
 	def __init__(self) -> None:
 		"""Initialize the pet care application with empty data structures."""
 		self.scheduler_service = SchedulerService()
+		self.scheduler_agent: SchedulerAgent = DeterministicSchedulerAgent(self.scheduler_service)
 		self.owners_by_id: dict[UUID, Owner] = {}
 		self.schedules_by_owner_date: dict[tuple[UUID, date], DailySchedule] = {}
 		self.task_completion_by_owner_date: dict[tuple[UUID, date, UUID], datetime | None] = {}
@@ -1433,17 +1842,12 @@ class PetCareApp:
 		context: PlanningContext,
 	) -> tuple[ScheduleCandidate, DailySchedule, int]:
 		"""Scheduler Agent wrapper that currently delegates to scheduler service."""
-		started_at = datetime.utcnow()
-		baseline_schedule = self.scheduler_service.generate_daily_schedule(context.owner, context.schedule_date)
-		duration_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
-		candidate = ScheduleCandidate(
-			proposed_items=list(baseline_schedule.items),
-			objective_score=float(len(baseline_schedule.items)),
-			rationale_summary="Delegated to SchedulerService for deterministic baseline candidate.",
-			generated_by=AgentRole.SCHEDULER,
-			advisory_only=AGENT_OUTPUTS_ADVISORY_ONLY,
+		agent_output = self.scheduler_agent.propose_candidate(context)
+		return (
+			agent_output.candidate,
+			agent_output.baseline_schedule,
+			agent_output.duration_ms,
 		)
-		return candidate, baseline_schedule, duration_ms
 
 	def _should_stop_retry(self, result: ValidationResult) -> bool:
 		"""Return True when retry loop should stop after a failed validation."""
@@ -1563,6 +1967,24 @@ class PetCareApp:
 		if owner is None:
 			raise ValueError("Owner not found")
 		owner.add_pet(pet)
+
+	def add_task(self, owner_id: UUID, pet_id: UUID, task: CareTask) -> ValidationResult:
+		"""Add task through app API with guardrail result surfaced to callers."""
+		owner = self.owners_by_id.get(owner_id)
+		if owner is None:
+			raise ValueError("Owner not found")
+
+		owner.add_task(pet_id, task)
+		return ValidationResult(status="pass")
+
+	def edit_task(self, owner_id: UUID, task_id: UUID, **changes: Any) -> ValidationResult:
+		"""Edit task through app API with guardrail result surfaced to callers."""
+		owner = self.owners_by_id.get(owner_id)
+		if owner is None:
+			raise ValueError("Owner not found")
+
+		owner.edit_task(task_id, **changes)
+		return ValidationResult(status="pass")
 
 	def run_daily_planning(self, owner_id: UUID, schedule_date: date) -> DailySchedule:
 		"""Generate and save a daily schedule for an owner.

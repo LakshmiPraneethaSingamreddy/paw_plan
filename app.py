@@ -16,6 +16,7 @@ from pawpal_system import (
     OwnerPreference,
     Pet,
     PetCareApp,
+    TaskValidationError,
     TaskCategory,
 )
 
@@ -336,12 +337,21 @@ priority_to_score = {"low": 1, "medium": 2, "high": 3}
 selected_task_category = TaskCategory[task_category]
 selected_task_frequency = Frequency[task_frequency]
 
+
+def _show_task_guardrail_feedback(error: TaskValidationError) -> None:
+    """Render task validation violations and repair hints in a compact UI block."""
+    st.error("Task was not saved because validation guardrails failed.")
+    for violation in error.result.violations:
+        st.write(f"- {violation.code}: {violation.message}")
+    if error.result.repair_hints:
+        st.info("Suggested fixes:")
+        for hint in error.result.repair_hints:
+            st.write(f"- {hint}")
+
 if st.button("Add task"):
     target_pet_id = selected_pet_id or st.session_state.pet_id
     if target_pet_id is None:
         st.error("Add a pet first, then add tasks.")
-    elif latest_end <= earliest_start:
-        st.error("Task latest end must be after earliest start.")
     else:
         task = CareTask(
             title=task_title,
@@ -358,10 +368,15 @@ if st.button("Add task"):
             is_flexible=is_flexible,
             notes=task_notes,
         )
-        owner.add_task(target_pet_id, task)
-        st.session_state.pet_id = target_pet_id
-        st.session_state.petcare_app.save_owner_info(owner)
-        st.success("Task added.")
+        try:
+            st.session_state.petcare_app.add_task(st.session_state.owner_id, target_pet_id, task)
+            st.session_state.pet_id = target_pet_id
+            st.session_state.petcare_app.save_owner_info(owner)
+            st.success("Task added.")
+        except TaskValidationError as validation_error:
+            _show_task_guardrail_feedback(validation_error)
+        except ValueError as value_error:
+            st.error(str(value_error))
 
 st.divider()
 
@@ -666,12 +681,9 @@ if all_tasks_with_pets:
                 st.rerun()
 
             if save_edit_clicked:
-                if edit_latest_end <= edit_earliest_start:
-                    st.error("Task latest end must be after earliest start.")
-                elif edit_task_frequency == Frequency.CUSTOM.name and edit_custom_interval_days is None and not edit_custom_days_of_week:
-                    st.error("Select at least one custom weekday or use interval mode.")
-                else:
-                    owner.edit_task(
+                try:
+                    st.session_state.petcare_app.edit_task(
+                        st.session_state.owner_id,
                         task.task_id,
                         title=edit_task_title,
                         category=TaskCategory[edit_task_category],
@@ -691,6 +703,10 @@ if all_tasks_with_pets:
                     st.session_state.editing_task_id = None
                     st.success(f"Updated task '{edit_task_title}'.")
                     st.rerun()
+                except TaskValidationError as validation_error:
+                    _show_task_guardrail_feedback(validation_error)
+                except (ValueError, AttributeError) as edit_error:
+                    st.error(str(edit_error))
 
         st.divider()
 else:

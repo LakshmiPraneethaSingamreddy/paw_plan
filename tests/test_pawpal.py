@@ -17,6 +17,7 @@ from pawpal_system import (
 	ScheduleStatus,
 	SchedulingConstraint,
 	TaskCategory,
+	TaskValidationError,
 )
 
 
@@ -169,6 +170,7 @@ def test_scheduler_respects_time_windows_for_morning_tasks():
 			duration_min=60,
 			priority=2,
 			frequency=Frequency.CUSTOM,
+			custom_days_of_week=[today.weekday()],
 			earliest_start=time(hour=8, minute=0),
 			latest_end=time(hour=9, minute=30),
 		),
@@ -181,6 +183,7 @@ def test_scheduler_respects_time_windows_for_morning_tasks():
 			duration_min=120,
 			priority=3,
 			frequency=Frequency.CUSTOM,
+			custom_days_of_week=[today.weekday()],
 			earliest_start=time(hour=12, minute=0),
 			latest_end=time(hour=14, minute=0),
 		),
@@ -655,128 +658,112 @@ def test_scheduler_returns_empty_when_no_availability_windows():
 	)
 
 
-# Verifies weekly tasks without explicit weekday fall back to created_on weekday.
-def test_weekly_task_without_weekday_uses_created_on_weekday():
+# Verifies weekly recurrence now requires an explicit weekday and rejects missing values.
+def test_weekly_task_without_weekday_is_rejected_by_guardrails():
 	app = PetCareApp()
 	owner, pet, today = _build_owner_with_pet(app)
-	next_day = today + timedelta(days=1)
 
-	owner.add_task(
-		pet.pet_id,
-		CareTask(
-			title="Weekly fallback grooming",
-			category=TaskCategory.GROOMING,
-			duration_min=20,
-			priority=2,
-			frequency=Frequency.WEEKLY,
-			weekly_day_of_week=None,
-			earliest_start=time(hour=8, minute=0),
-			latest_end=time(hour=12, minute=0),
-		),
-	)
-
-	today_schedule = app.run_daily_planning(owner.owner_id, today)
-	assert any(item.task and item.task.title == "Weekly fallback grooming" for item in today_schedule.items)
-
-	next_day_schedule = app.run_daily_planning(owner.owner_id, next_day)
-	assert not any(item.task and item.task.title == "Weekly fallback grooming" for item in next_day_schedule.items)
-
-
-# Verifies legacy custom recurrence with no anchor behaves like daily scheduling.
-def test_custom_interval_without_anchor_uses_backward_compatible_daily_behavior():
-	app = PetCareApp()
-	owner, pet, today = _build_owner_with_pet(app)
-	next_day = today + timedelta(days=1)
-	owner.availability_windows.append(
-		AvailabilityWindow(
-			day_of_week=next_day.weekday(),
-			start_time=time(hour=6, minute=0),
-			end_time=time(hour=22, minute=0),
+	with pytest.raises(TaskValidationError) as exc_info:
+		owner.add_task(
+			pet.pet_id,
+			CareTask(
+				title="Weekly fallback grooming",
+				category=TaskCategory.GROOMING,
+				duration_min=20,
+				priority=2,
+				frequency=Frequency.WEEKLY,
+				weekly_day_of_week=None,
+				earliest_start=time(hour=8, minute=0),
+				latest_end=time(hour=12, minute=0),
+			),
 		)
-	)
 
-	owner.add_task(
-		pet.pet_id,
-		CareTask(
-			title="Custom no-anchor meds",
-			category=TaskCategory.MEDICATION,
-			duration_min=10,
-			priority=2,
-			frequency=Frequency.CUSTOM,
-			custom_interval_days=2,
-			custom_anchor_date=None,
-			earliest_start=time(hour=9, minute=0),
-			latest_end=time(hour=11, minute=0),
-		),
-	)
-
-	today_schedule = app.run_daily_planning(owner.owner_id, today)
-	next_day_schedule = app.run_daily_planning(owner.owner_id, next_day)
-
-	assert any(item.task and item.task.title == "Custom no-anchor meds" for item in today_schedule.items)
-	assert any(item.task and item.task.title == "Custom no-anchor meds" for item in next_day_schedule.items)
+	assert len(pet.tasks) == 0
+	assert any(v.code == "INCOHERENT_RECURRENCE_WEEKLY_DAY" for v in exc_info.value.result.violations)
 
 
-# Verifies non-positive custom intervals are excluded by recurrence filtering.
-def test_custom_interval_non_positive_is_skipped_by_recurrence_rules():
+# Verifies custom interval recurrence requires an anchor date in Phase 2.
+def test_custom_interval_without_anchor_is_rejected_by_guardrails():
 	app = PetCareApp()
 	owner, pet, today = _build_owner_with_pet(app)
 
-	owner.add_task(
-		pet.pet_id,
-		CareTask(
-			title="Broken interval task",
-			category=TaskCategory.MEDICATION,
-			duration_min=10,
-			priority=2,
-			frequency=Frequency.CUSTOM,
-			custom_interval_days=0,
-			custom_anchor_date=today,
-			earliest_start=time(hour=9, minute=0),
-			latest_end=time(hour=11, minute=0),
-		),
-	)
+	with pytest.raises(TaskValidationError) as exc_info:
+		owner.add_task(
+			pet.pet_id,
+			CareTask(
+				title="Custom no-anchor meds",
+				category=TaskCategory.MEDICATION,
+				duration_min=10,
+				priority=2,
+				frequency=Frequency.CUSTOM,
+				custom_interval_days=2,
+				custom_anchor_date=None,
+				earliest_start=time(hour=9, minute=0),
+				latest_end=time(hour=11, minute=0),
+			),
+		)
 
-	schedule = app.run_daily_planning(owner.owner_id, today)
-
-	assert not any(item.task and item.task.title == "Broken interval task" for item in schedule.items)
-	assert any("skipped 1 task(s) by recurrence rules" in explanation.message for explanation in schedule.explanations)
+	assert len(pet.tasks) == 0
+	assert any(v.code == "INCOHERENT_RECURRENCE_CUSTOM_ANCHOR" for v in exc_info.value.result.violations)
 
 
-# Verifies tasks with zero/negative duration are skipped with explanatory messaging.
-def test_scheduler_skips_zero_or_negative_duration_tasks():
+# Verifies non-positive custom intervals are rejected before persistence.
+def test_custom_interval_non_positive_is_rejected_by_guardrails():
 	app = PetCareApp()
 	owner, pet, today = _build_owner_with_pet(app)
 
-	owner.add_task(
-		pet.pet_id,
-		CareTask(
-			title="Zero duration task",
-			category=TaskCategory.FEEDING,
-			duration_min=0,
-			priority=3,
-			earliest_start=time(hour=8, minute=0),
-			latest_end=time(hour=9, minute=0),
-		),
-	)
-	owner.add_task(
-		pet.pet_id,
-		CareTask(
-			title="Negative duration task",
-			category=TaskCategory.PLAY,
-			duration_min=-10,
-			priority=3,
-			earliest_start=time(hour=9, minute=0),
-			latest_end=time(hour=10, minute=0),
-		),
-	)
+	with pytest.raises(TaskValidationError) as exc_info:
+		owner.add_task(
+			pet.pet_id,
+			CareTask(
+				title="Broken interval task",
+				category=TaskCategory.MEDICATION,
+				duration_min=10,
+				priority=2,
+				frequency=Frequency.CUSTOM,
+				custom_interval_days=0,
+				custom_anchor_date=today,
+				earliest_start=time(hour=9, minute=0),
+				latest_end=time(hour=11, minute=0),
+			),
+		)
 
-	schedule = app.run_daily_planning(owner.owner_id, today)
+	assert len(pet.tasks) == 0
+	assert any(v.code == "INCOHERENT_RECURRENCE_CUSTOM_INTERVAL" for v in exc_info.value.result.violations)
 
-	scheduled_titles = [item.task.title for item in schedule.items if item.task]
-	assert "Zero duration task" not in scheduled_titles
-	assert "Negative duration task" not in scheduled_titles
-	assert any("task duration is 0 minutes" in explanation.message for explanation in schedule.explanations)
+
+# Verifies zero/negative durations are rejected before persistence.
+def test_scheduler_rejects_zero_or_negative_duration_tasks():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	with pytest.raises(TaskValidationError):
+		owner.add_task(
+			pet.pet_id,
+			CareTask(
+				title="Zero duration task",
+				category=TaskCategory.FEEDING,
+				duration_min=0,
+				priority=3,
+				earliest_start=time(hour=8, minute=0),
+				latest_end=time(hour=9, minute=0),
+			),
+		)
+
+	with pytest.raises(TaskValidationError):
+		owner.add_task(
+			pet.pet_id,
+			CareTask(
+				title="Negative duration task",
+				category=TaskCategory.PLAY,
+				duration_min=-10,
+				priority=3,
+				earliest_start=time(hour=9, minute=0),
+				latest_end=time(hour=10, minute=0),
+			),
+		)
+
+	assert len(pet.tasks) == 0
 
 
 # Verifies deterministic ordering for tasks with identical priority and time windows.
