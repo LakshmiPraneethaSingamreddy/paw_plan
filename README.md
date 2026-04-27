@@ -133,6 +133,24 @@ This section defines the non-negotiable architecture contract before agent orche
    - `DailySchedule.regenerate()` validates items, removes invalid entries, and adjusts non-locked overlaps.
    - Planning summary and per-task reason codes improve explainability/debuggability.
 
+## Phase 6: Shared Retrieval for Explanation Grounding and Advisory Hints
+
+This project now combines the original phase 6 and phase 7 plans into one shared retrieval layer.
+
+### What the retrieval layer does
+
+1. Builds a small local corpus from owner preferences, recent schedule outcomes, policy snippets, and recurring routine patterns.
+2. Chunks each stored snippet into smaller queryable units before ranking and retrieves top-k matches with source attribution.
+3. Falls back to no match when retrieval confidence is too low, so the system can stay deterministic instead of forcing weak context.
+4. Grounds the Explanation Agent first, then reuses the same retrieval hints for suggestion-level task normalization and scheduler advisory metadata.
+5. Keeps the final schedule acceptance path deterministic and validator-gated.
+
+### Guardrails
+
+1. Explanation text must be supported by schedule state or retrieved snippets.
+2. Non-trivial claims without attribution are rejected from the explanation output.
+3. Retrieval can suggest corrections and heuristics, but it cannot override the deterministic scheduler or validation rules.
+
 ## Getting started
 
 ### Setup

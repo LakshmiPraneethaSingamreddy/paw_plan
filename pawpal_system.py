@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from enum import Enum
+import re
 from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
@@ -375,6 +376,108 @@ class PlanningContext:
 	owner_id: UUID
 	owner: Owner
 	schedule_date: date
+
+
+@dataclass
+class RetrievalSnippet:
+	"""A short, attributed snippet returned by the local retrieval layer."""
+	snippet_id: UUID = field(default_factory=uuid4)
+	source_type: str = ""
+	source_label: str = ""
+	content: str = ""
+	metadata: dict[str, Any] = field(default_factory=dict)
+	score: float = 0.0
+
+	@property
+	def attribution(self) -> str:
+		return f"{self.source_type}:{self.source_label}"
+
+
+@dataclass
+class RetrievalChunk:
+	"""A queryable chunk produced from a larger retrieval snippet."""
+	chunk_id: UUID = field(default_factory=uuid4)
+	chunk_index: int = 0
+	chunk_total: int = 0
+	snippet: RetrievalSnippet = field(default_factory=RetrievalSnippet)
+	content: str = ""
+
+	@property
+	def attribution(self) -> str:
+		return f"{self.snippet.attribution}#chunk{self.chunk_index + 1}"
+
+
+class LocalRetrievalCorpus:
+	"""Small in-memory corpus used for explanation grounding and advisory hints."""
+
+	TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+	CHUNK_SEPARATOR_PATTERN = re.compile(r"[.;\n]+")
+	MIN_RETRIEVAL_SCORE = 1.0
+
+	def __init__(self, snippets: list[RetrievalSnippet] | None = None) -> None:
+		self._snippets = snippets or []
+
+	def add(self, snippet: RetrievalSnippet) -> None:
+		self._snippets.append(snippet)
+
+	def extend(self, snippets: list[RetrievalSnippet]) -> None:
+		self._snippets.extend(snippets)
+
+	def chunk_snippet(self, snippet: RetrievalSnippet) -> list[RetrievalChunk]:
+		parts = [part.strip() for part in self.CHUNK_SEPARATOR_PATTERN.split(snippet.content) if part.strip()]
+		if not parts:
+			parts = [snippet.content.strip()] if snippet.content.strip() else []
+		chunk_total = len(parts)
+		return [
+			RetrievalChunk(
+				chunk_index=index,
+				chunk_total=chunk_total,
+				snippet=snippet,
+				content=part,
+			)
+			for index, part in enumerate(parts)
+		]
+
+	def _tokenize(self, text: str) -> set[str]:
+		return {match.group(0) for match in self.TOKEN_PATTERN.finditer(text.lower())}
+
+	def _score_chunk(self, query_tokens: set[str], chunk: RetrievalChunk) -> float:
+		chunk_tokens = self._tokenize(f"{chunk.snippet.source_type} {chunk.snippet.source_label} {chunk.content}")
+		if not chunk_tokens:
+			return 0.0
+		overlap = len(query_tokens & chunk_tokens)
+		score = float(overlap)
+		if chunk.snippet.metadata.get("is_recent"):
+			score += 0.5
+		if chunk.snippet.metadata.get("is_policy"):
+			score += 0.25
+		return score
+
+	def retrieve(self, query: str, top_k: int = 3) -> list[RetrievalSnippet]:
+		query_tokens = self._tokenize(query)
+		if not query_tokens or top_k <= 0:
+			return []
+
+		scored_snippets: list[RetrievalSnippet] = []
+		for snippet in self._snippets:
+			for chunk in self.chunk_snippet(snippet):
+				score = self._score_chunk(query_tokens, chunk)
+				if score < self.MIN_RETRIEVAL_SCORE:
+					continue
+				scored_snippets.append(
+					replace(
+						snippet,
+						source_label=chunk.attribution,
+						content=chunk.content,
+						score=score,
+					)
+				)
+
+		scored_snippets.sort(key=lambda snippet: (-snippet.score, snippet.source_type, snippet.source_label, snippet.content))
+		return scored_snippets[:top_k]
+
+	def is_empty(self) -> bool:
+		return not self._snippets
 
 
 def _is_within_availability(item: ScheduleItem, day_windows: list[AvailabilityWindow]) -> bool:
@@ -1274,6 +1377,27 @@ class SchedulerService:
 			return schedule
 
 		expanded_pairs, recurrence_skipped = self._expand_recurring_tasks(all_tasks, schedule_date)
+		explanations: list[PlanExplanation] = []
+		reason_codes_used: set[str] = set()
+		skipped_count = 0
+		invalid_duration_pairs = [
+			(pair)
+			for pair in expanded_pairs
+			if pair[1].duration_min <= 0
+		]
+
+		for _, task in invalid_duration_pairs:
+			explanations.append(
+				PlanExplanation(
+					message=(f"Skipped '{task.title}' because duration_min must be positive, got {task.duration_min}."),
+					rule_applied="task_skipped_invalid_duration",
+					impact_score=1.0,
+				)
+			)
+			skipped_count += 1
+			reason_codes_used.add("TASK_SKIPPED_INVALID_DURATION")
+
+		expanded_pairs = [pair for pair in expanded_pairs if pair[1].duration_min > 0]
 
 		filtered_tasks = self.apply_constraints(
 			[t for _, t in expanded_pairs],
@@ -1295,9 +1419,6 @@ class SchedulerService:
 		]
 		candidate_pairs.sort(key=ordering_key)
 
-		explanations: list[PlanExplanation] = []
-		reason_codes_used: set[str] = set()
-		skipped_count = 0
 		for pet_id, task in candidate_pairs:
 			slot, decision_reason, removed_tasks, deferred_tasks = self._try_schedule_with_backtracking(
 				task, pet_id, schedule_date, day_windows, schedule.items
@@ -1682,6 +1803,8 @@ class SchedulerService:
 
 		filtered: list[CareTask] = []
 		for task in tasks:
+			if task.duration_min <= 0:
+				continue
 			if owner.preference and owner.preference.avoid_late_night:
 				if task.latest_end is not None and task.latest_end >= time(hour=22, minute=0):
 					continue
@@ -1797,6 +1920,7 @@ class ExplanationAgent(Protocol):
 		context: PlanningContext,
 		candidate: ScheduleCandidate,
 		schedule: DailySchedule,
+		retrieved_snippets: list[RetrievalSnippet] | None = None,
 	) -> list[PlanExplanation]:
 		"""Return grounded explanations for the chosen schedule."""
 
@@ -1838,6 +1962,19 @@ class DeterministicSchedulerAgent:
 
 class DeterministicExplanationAgent:
 	"""Build rich, fact-grounded explanations from concrete schedule state only."""
+
+	UNSUPPORTED_CLAIM_MARKERS = ("best", "optimal", "guaranteed", "always", "never", "certainly")
+
+	def _build_retrieval_source_text(self, snippet: RetrievalSnippet) -> str:
+		return f"[{snippet.attribution}] {snippet.content}"
+
+	def _contains_obvious_unsupported_claim(self, message: str, retrieved_snippets: list[RetrievalSnippet] | None) -> bool:
+		lower_message = message.lower()
+		if not any(marker in lower_message for marker in self.UNSUPPORTED_CLAIM_MARKERS):
+			return False
+
+		retrieved_text = " ".join(snippet.content.lower() for snippet in retrieved_snippets or [])
+		return not any(marker in retrieved_text for marker in self.UNSUPPORTED_CLAIM_MARKERS)
 
 	def _get_day_windows(self, context: PlanningContext) -> list[AvailabilityWindow]:
 		day_windows = [
@@ -1926,21 +2063,28 @@ class DeterministicExplanationAgent:
 		explanation: PlanExplanation,
 		schedule: DailySchedule,
 		context: PlanningContext,
+		retrieved_snippets: list[RetrievalSnippet] | None = None,
 	) -> bool:
 		message = explanation.message
 		if not message:
 			return False
 
 		if explanation.rule_applied == "phase4_grounded_summary":
+			if self._contains_obvious_unsupported_claim(message, retrieved_snippets):
+				return False
 			return (
 				context.schedule_date.isoformat() in message
 				and str(len(schedule.items)) in message
 			)
 
 		if explanation.rule_applied == "phase4_conflict_and_deferral_facts":
+			if self._contains_obvious_unsupported_claim(message, retrieved_snippets):
+				return False
 			return "overlap(s) detected" in message and "deferral" in message
 
 		if explanation.rule_applied == "phase4_grounded_item":
+			if self._contains_obvious_unsupported_claim(message, retrieved_snippets):
+				return False
 			if "Feasible because" not in message:
 				return False
 			if not any(item.reason_code in message for item in schedule.items if item.reason_code):
@@ -1952,6 +2096,17 @@ class DeterministicExplanationAgent:
 				for item in schedule.items
 			)
 
+		if explanation.rule_applied == "phase6_retrieved_context":
+			if self._contains_obvious_unsupported_claim(message, retrieved_snippets):
+				return False
+			if "Sources:" not in message:
+				return False
+			if context.schedule_date.isoformat() not in message:
+				return False
+			if retrieved_snippets is None or not retrieved_snippets:
+				return False
+			return all(snippet.attribution in message for snippet in retrieved_snippets)
+
 		return False
 
 	def expand_explanations(
@@ -1959,6 +2114,7 @@ class DeterministicExplanationAgent:
 		context: PlanningContext,
 		candidate: ScheduleCandidate,
 		schedule: DailySchedule,
+		retrieved_snippets: list[RetrievalSnippet] | None = None,
 	) -> list[PlanExplanation]:
 		"""Enrich schedule explanations using grounded schedule facts only."""
 		base_explanations = list(schedule.explanations)
@@ -2013,13 +2169,37 @@ class DeterministicExplanationAgent:
 			if item_explanation is not None:
 				phase4_explanations.append(item_explanation)
 
+		phase6_explanations: list[PlanExplanation] = []
+		if retrieved_snippets:
+			source_text = "; ".join(self._build_retrieval_source_text(snippet) for snippet in retrieved_snippets)
+			phase6_explanations.append(
+				PlanExplanation(
+					message=(
+						f"Retrieved context for {context.schedule_date.isoformat()} supports the plan. "
+						f"Sources: {source_text}."
+					),
+					rule_applied="phase6_retrieved_context",
+					impact_score=0.95,
+				)
+			)
+
 		grounded_phase4 = [
 			explanation
 			for explanation in phase4_explanations
 			if self._passes_groundedness_guardrails(explanation, schedule=schedule, context=context)
 		]
+		grounded_phase6 = [
+			explanation
+			for explanation in phase6_explanations
+			if self._passes_groundedness_guardrails(
+				explanation,
+				schedule=schedule,
+				context=context,
+				retrieved_snippets=retrieved_snippets,
+			)
+		]
 
-		return base_explanations + grounded_phase4
+		return base_explanations + grounded_phase4 + grounded_phase6
 
 
 class PetCareApp:
@@ -2039,6 +2219,7 @@ class PetCareApp:
 		self.scheduler_service = SchedulerService()
 		self.scheduler_agent: SchedulerAgent = DeterministicSchedulerAgent(self.scheduler_service)
 		self.explanation_agent: ExplanationAgent = DeterministicExplanationAgent()
+		self.retrieval_corpus = LocalRetrievalCorpus()
 		self.owners_by_id: dict[UUID, Owner] = {}
 		self.schedules_by_owner_date: dict[tuple[UUID, date], DailySchedule] = {}
 		self.task_completion_by_owner_date: dict[tuple[UUID, date, UUID], datetime | None] = {}
@@ -2051,12 +2232,138 @@ class PetCareApp:
 		"""Build deterministic planning context for the orchestration loop."""
 		return PlanningContext(owner_id=owner_id, owner=owner, schedule_date=schedule_date)
 
+	def _build_retrieval_corpus(self, owner: Owner, schedule_date: date) -> LocalRetrievalCorpus:
+		"""Create a small local corpus from preferences, routines, outcomes, and policies."""
+		corpus = LocalRetrievalCorpus()
+
+		corpus.extend(
+			[
+				RetrievalSnippet(
+					source_type="policy",
+					source_label="hard_constraints",
+					content="; ".join(HARD_CONSTRAINT_RULES),
+					metadata={"is_policy": True},
+				),
+				RetrievalSnippet(
+					source_type="policy",
+					source_label="fallback_policy",
+					content=DETERMINISTIC_FALLBACK_POLICY,
+					metadata={"is_policy": True},
+				),
+				RetrievalSnippet(
+					source_type="policy",
+					source_label="source_of_truth",
+					content=SCHEDULE_SOURCE_OF_TRUTH,
+					metadata={"is_policy": True},
+				),
+			]
+		)
+
+		if owner.preference is not None:
+			corpus.add(
+				RetrievalSnippet(
+					source_type="owner_preference",
+					source_label=str(owner.owner_id),
+					content=(
+						f"avoid_late_night={owner.preference.avoid_late_night}; "
+						f"max_tasks_per_block={owner.preference.max_tasks_per_block}; "
+						f"preferred_task_order={owner.preference.preferred_task_order}; "
+						f"notification_lead_min={owner.preference.notification_lead_min}"
+					),
+				)
+			)
+
+		routine_snippets: list[RetrievalSnippet] = []
+		for pet in owner.pets:
+			for task in pet.tasks:
+				routine_snippets.append(
+					RetrievalSnippet(
+						source_type="routine",
+						source_label=f"{pet.name}:{task.title}",
+						content=(
+							f"{task.title} for {pet.name} ({task.category.value}), duration={task.duration_min}m, "
+							f"priority={task.priority}, flexible={task.is_flexible}, frequency={task.frequency.value}"
+						),
+						metadata={"pet_id": str(pet.pet_id), "task_id": str(task.task_id)},
+					)
+				)
+		corpus.extend(routine_snippets)
+
+		recent_schedules = [
+			(schedule_date_key, schedule)
+			for schedule_date_key, schedule in sorted(owner.schedules_by_date.items(), key=lambda entry: entry[0], reverse=True)
+			if schedule_date_key < schedule_date
+		][:3]
+		for recent_date, schedule in recent_schedules:
+			corpus.add(
+				RetrievalSnippet(
+					source_type="recent_outcome",
+					source_label=recent_date.isoformat(),
+					content=(
+						f"scheduled_count={len(schedule.items)}; unscheduled_count={schedule.planning_metadata.get('unscheduled_count', 0)}; "
+						f"strategy={schedule.planning_metadata.get('strategy', 'unknown')}"
+					),
+					metadata={"is_recent": True, "schedule_id": str(schedule.schedule_id)},
+				)
+			)
+
+		return corpus
+
+	def _retrieve_context_snippets(self, owner: Owner, schedule_date: date, query: str, top_k: int = 3) -> list[RetrievalSnippet]:
+		corpus = self._build_retrieval_corpus(owner, schedule_date)
+		return corpus.retrieve(query=query, top_k=top_k)
+
+	def _augment_task_validation_result(
+		self,
+		owner: Owner,
+		pet_id: UUID,
+		task: CareTask,
+		validation_result: ValidationResult,
+	) -> ValidationResult:
+		if validation_result.passed:
+			return validation_result
+
+		retrieved_snippets = self._retrieve_context_snippets(
+			owner=owner,
+			schedule_date=date.today(),
+			query=f"{task.title} {task.category.value} {task.frequency.value} {' '.join(validation_result.repair_hints)}",
+			top_k=2,
+		)
+		routine_snippets = [snippet for snippet in retrieved_snippets if snippet.source_type == "routine"]
+		if routine_snippets:
+			validation_result.repair_hints.append(
+				f"Normalization suggestion from retrieval: align this task with {routine_snippets[0].attribution} -> {routine_snippets[0].content}."
+			)
+		for snippet in retrieved_snippets:
+			hint = f"Retrieved correction hint from {snippet.attribution}: {snippet.content}"
+			if hint not in validation_result.repair_hints:
+				validation_result.repair_hints.append(hint)
+		return validation_result
+
 	def _run_scheduler_agent_wrapper(
 		self,
 		context: PlanningContext,
 	) -> tuple[ScheduleCandidate, DailySchedule, int]:
 		"""Scheduler Agent wrapper that currently delegates to scheduler service."""
 		agent_output = self.scheduler_agent.propose_candidate(context)
+		retrieved_snippets = self._retrieve_context_snippets(
+			owner=context.owner,
+			schedule_date=context.schedule_date,
+			query=f"{agent_output.candidate.rationale_summary} {' '.join(agent_output.candidate.reason_codes)} {' '.join(HARD_CONSTRAINT_RULES)}",
+			top_k=2,
+		)
+		if retrieved_snippets:
+			agent_output.candidate.rationale_metadata = dict(agent_output.candidate.rationale_metadata)
+			agent_output.candidate.rationale_metadata["retrieval_hints"] = [
+				{
+					"attribution": snippet.attribution,
+					"content": snippet.content,
+					"score": snippet.score,
+				}
+				for snippet in retrieved_snippets
+			]
+			agent_output.baseline_schedule.planning_metadata = dict(agent_output.baseline_schedule.planning_metadata)
+			agent_output.baseline_schedule.planning_metadata["retrieval_hint_count"] = len(retrieved_snippets)
 		return (
 			agent_output.candidate,
 			agent_output.baseline_schedule,
@@ -2224,10 +2531,17 @@ class PetCareApp:
 		schedule: DailySchedule,
 	) -> DailySchedule:
 		"""Expand explanations after scheduling while preserving PlanExplanation list compatibility."""
+		retrieved_snippets = self._retrieve_context_snippets(
+			owner=context.owner,
+			schedule_date=context.schedule_date,
+			query=f"{candidate.rationale_summary} {' '.join(candidate.reason_codes)} {schedule.planning_metadata.get('strategy', '')} {schedule.planning_metadata.get('ordering_policy', '')}",
+			top_k=3,
+		)
 		schedule.explanations = self.explanation_agent.expand_explanations(
 			context=context,
 			candidate=candidate,
 			schedule=schedule,
+			retrieved_snippets=retrieved_snippets,
 		)
 		self.scheduler_service.explanations_by_schedule_id[schedule.schedule_id] = schedule.explanations
 		return schedule
@@ -2481,7 +2795,11 @@ class PetCareApp:
 		if owner is None:
 			raise ValueError("Owner not found")
 
-		owner.add_task(pet_id, task)
+		try:
+			owner.add_task(pet_id, task)
+		except TaskValidationError as exc:
+			self._augment_task_validation_result(owner, pet_id, task, exc.result)
+			raise TaskValidationError(exc.result) from None
 		return ValidationResult(status="pass")
 
 	def edit_task(self, owner_id: UUID, task_id: UUID, **changes: Any) -> ValidationResult:
@@ -2490,7 +2808,22 @@ class PetCareApp:
 		if owner is None:
 			raise ValueError("Owner not found")
 
-		owner.edit_task(task_id, **changes)
+		try:
+			owner.edit_task(task_id, **changes)
+		except TaskValidationError as exc:
+			pet_id = owner.task_to_pet.get(task_id)
+			original_pet = owner._get_pet_by_id(pet_id) if pet_id is not None else None
+			candidate_task = None
+			if original_pet is not None:
+				for existing_task in original_pet.tasks:
+					if existing_task.task_id == task_id:
+						candidate_task = replace(existing_task)
+						for field_name, field_value in changes.items():
+							setattr(candidate_task, field_name, field_value)
+						break
+			if candidate_task is not None and pet_id is not None:
+				self._augment_task_validation_result(owner, pet_id, candidate_task, exc.result)
+			raise TaskValidationError(exc.result) from None
 		return ValidationResult(status="pass")
 
 	def run_daily_planning(self, owner_id: UUID, schedule_date: date) -> DailySchedule:

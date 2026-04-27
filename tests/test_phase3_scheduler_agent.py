@@ -149,3 +149,37 @@ def test_scheduler_outputs_machine_readable_reason_codes_and_summary_metadata():
 	candidate, _, _ = app._run_scheduler_agent_wrapper(context)
 	assert candidate.reason_codes
 	assert "reason_codes" in candidate.planning_summary_metadata
+
+
+def test_scheduler_skips_zero_duration_tasks_even_if_they_reach_the_model():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	valid_task = CareTask(
+		title="Morning walk",
+		category=TaskCategory.WALKING,
+		duration_min=20,
+		priority=2,
+		earliest_start=time(hour=8, minute=0),
+		latest_end=time(hour=9, minute=0),
+	)
+	invalid_task = CareTask(
+		title="Bad task",
+		category=TaskCategory.PLAY,
+		duration_min=0,
+		priority=1,
+		earliest_start=time(hour=9, minute=0),
+		latest_end=time(hour=10, minute=0),
+	)
+
+	owner.add_task(pet.pet_id, valid_task)
+	pet.tasks.append(invalid_task)
+	owner.task_to_pet[invalid_task.task_id] = pet.pet_id
+
+	schedule = app.run_daily_planning(owner.owner_id, today)
+
+	assert all(item.task is None or item.task.duration_min > 0 for item in schedule.items)
+	assert any(
+		explanation.rule_applied == "task_skipped_invalid_duration"
+		for explanation in schedule.explanations
+	)
