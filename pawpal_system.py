@@ -1775,6 +1775,18 @@ class SchedulerAgent(Protocol):
 		"""Return advisory candidate plus deterministic baseline schedule."""
 
 
+class ExplanationAgent(Protocol):
+	"""Explanation Agent interface for grounded explanation expansion."""
+
+	def expand_explanations(
+		self,
+		context: PlanningContext,
+		candidate: ScheduleCandidate,
+		schedule: DailySchedule,
+	) -> list[PlanExplanation]:
+		"""Return grounded explanations for the chosen schedule."""
+
+
 class DeterministicSchedulerAgent:
 	"""Engine-first Scheduler Agent backed by deterministic planning logic."""
 
@@ -1810,6 +1822,192 @@ class DeterministicSchedulerAgent:
 		)
 
 
+class DeterministicExplanationAgent:
+	"""Build rich, fact-grounded explanations from concrete schedule state only."""
+
+	def _get_day_windows(self, context: PlanningContext) -> list[AvailabilityWindow]:
+		day_windows = [
+			window
+			for window in context.owner.availability_windows
+			if window.day_of_week == context.schedule_date.weekday()
+		]
+		day_windows.sort(key=lambda window: window.start_time or time(hour=0, minute=0))
+		return day_windows
+
+	def _window_for_item(
+		self,
+		item: ScheduleItem,
+		day_windows: list[AvailabilityWindow],
+	) -> tuple[time, time] | None:
+		if item.start_time is None or item.end_time is None:
+			return None
+
+		for window in day_windows:
+			start_t = window.start_time or time(hour=0, minute=0)
+			end_t = window.end_time or time(hour=23, minute=59)
+			window_start = datetime.combine(item.start_time.date(), start_t)
+			window_end = datetime.combine(item.start_time.date(), end_t)
+			if item.start_time >= window_start and item.end_time <= window_end:
+				return (start_t, end_t)
+
+		return None
+
+	def _count_overlaps(self, items: list[ScheduleItem]) -> int:
+		sorted_items = [
+			item
+			for item in sorted(items, key=lambda scheduled_item: scheduled_item.start_time or datetime.min)
+			if item.start_time is not None and item.end_time is not None
+		]
+		overlaps = 0
+		for previous_item, current_item in zip(sorted_items, sorted_items[1:]):
+			if previous_item.end_time > current_item.start_time:
+				overlaps += 1
+		return overlaps
+
+	def _build_item_explanation(
+		self,
+		item: ScheduleItem,
+		day_windows: list[AvailabilityWindow],
+	) -> PlanExplanation | None:
+		if item.task is None or item.start_time is None or item.end_time is None:
+			return None
+
+		task = item.task
+		early_text = task.earliest_start.strftime("%H:%M") if task.earliest_start is not None else "none"
+		latest_text = task.latest_end.strftime("%H:%M") if task.latest_end is not None else "none"
+		window = self._window_for_item(item, day_windows)
+
+		feasible_facts: list[str] = []
+		if window is not None:
+			feasible_facts.append(
+				f"inside owner availability {window[0].strftime('%H:%M')}-{window[1].strftime('%H:%M')}"
+			)
+		else:
+			feasible_facts.append("inside known availability windows could not be confirmed")
+
+		if task.earliest_start is not None and item.start_time.time() >= task.earliest_start:
+			feasible_facts.append(f"starts after earliest_start {early_text}")
+
+		if task.latest_end is not None:
+			if item.end_time.time() <= task.latest_end:
+				feasible_facts.append(f"ends by latest_end {latest_text}")
+			elif task.is_flexible:
+				feasible_facts.append(
+					f"ends after latest_end {latest_text} but task is flexible"
+				)
+
+		return PlanExplanation(
+			message=(
+				f"Grounded decision for '{task.title}': scheduled {item.start_time.strftime('%H:%M')}-"
+				f"{item.end_time.strftime('%H:%M')} (priority={task.priority}, flexible={task.is_flexible}, "
+				f"reason_code={item.reason_code}). Feasible because "
+				f"{'; '.join(feasible_facts)}."
+			),
+			rule_applied="phase4_grounded_item",
+			impact_score=0.8,
+		)
+
+	def _passes_groundedness_guardrails(
+		self,
+		explanation: PlanExplanation,
+		schedule: DailySchedule,
+		context: PlanningContext,
+	) -> bool:
+		message = explanation.message
+		if not message:
+			return False
+
+		if explanation.rule_applied == "phase4_grounded_summary":
+			return (
+				context.schedule_date.isoformat() in message
+				and str(len(schedule.items)) in message
+			)
+
+		if explanation.rule_applied == "phase4_conflict_and_deferral_facts":
+			return "overlap(s) detected" in message and "deferral" in message
+
+		if explanation.rule_applied == "phase4_grounded_item":
+			if "Feasible because" not in message:
+				return False
+			if not any(item.reason_code in message for item in schedule.items if item.reason_code):
+				return False
+			return any(
+				item.task is not None
+				and item.task.title
+				and item.task.title in message
+				for item in schedule.items
+			)
+
+		return False
+
+	def expand_explanations(
+		self,
+		context: PlanningContext,
+		candidate: ScheduleCandidate,
+		schedule: DailySchedule,
+	) -> list[PlanExplanation]:
+		"""Enrich schedule explanations using grounded schedule facts only."""
+		base_explanations = list(schedule.explanations)
+		day_windows = self._get_day_windows(context)
+		window_text = (
+			", ".join(
+				f"{(window.start_time or time(hour=0, minute=0)).strftime('%H:%M')}-"
+				f"{(window.end_time or time(hour=23, minute=59)).strftime('%H:%M')}"
+				for window in day_windows
+			)
+			if day_windows
+			else "none"
+		)
+
+		planning_metadata = schedule.planning_metadata
+		recurrence_skipped = int(planning_metadata.get("recurrence_skipped_count", 0))
+		unscheduled_count = int(planning_metadata.get("unscheduled_count", 0))
+		ordering_policy = str(planning_metadata.get("ordering_policy", "unknown"))
+		strategy = str(planning_metadata.get("strategy", "unknown"))
+
+		overlap_count = self._count_overlaps(schedule.items)
+		deferral_count = sum(1 for item in schedule.items if item.reason_code == "PLACED_WITH_DEFERRAL")
+		backtrack_remove_count = sum(
+			1 for item in schedule.items if item.reason_code == "PLACED_WITH_BACKTRACK_REMOVE"
+		)
+
+		phase4_explanations: list[PlanExplanation] = [
+			PlanExplanation(
+				message=(
+					f"Grounded planning summary for {context.schedule_date.isoformat()}: "
+					f"scheduled {len(schedule.items)} task(s). Constraints used: owner availability windows [{window_text}], "
+					"no-overlap guardrail, rigid earliest_start/latest_end windows for non-flexible tasks. "
+					f"Policy: {ordering_policy}. Strategy: {strategy}. "
+					f"Recurrence skipped {recurrence_skipped}, unscheduled {unscheduled_count}."
+				),
+				rule_applied="phase4_grounded_summary",
+				impact_score=1.0,
+			),
+			PlanExplanation(
+				message=(
+					f"Conflict and deferral facts: {overlap_count} overlap(s) detected in final schedule state, "
+					f"deferral placements={deferral_count}, backtrack removals={backtrack_remove_count}, "
+					f"candidate reason codes={', '.join(candidate.reason_codes) if candidate.reason_codes else 'none'}."
+				),
+				rule_applied="phase4_conflict_and_deferral_facts",
+				impact_score=0.9,
+			),
+		]
+
+		for item in sorted(schedule.items, key=lambda scheduled_item: scheduled_item.start_time or datetime.min):
+			item_explanation = self._build_item_explanation(item=item, day_windows=day_windows)
+			if item_explanation is not None:
+				phase4_explanations.append(item_explanation)
+
+		grounded_phase4 = [
+			explanation
+			for explanation in phase4_explanations
+			if self._passes_groundedness_guardrails(explanation, schedule=schedule, context=context)
+		]
+
+		return base_explanations + grounded_phase4
+
+
 class PetCareApp:
 	"""Main application for managing pet care and scheduling.
 	
@@ -1826,6 +2024,7 @@ class PetCareApp:
 		"""Initialize the pet care application with empty data structures."""
 		self.scheduler_service = SchedulerService()
 		self.scheduler_agent: SchedulerAgent = DeterministicSchedulerAgent(self.scheduler_service)
+		self.explanation_agent: ExplanationAgent = DeterministicExplanationAgent()
 		self.owners_by_id: dict[UUID, Owner] = {}
 		self.schedules_by_owner_date: dict[tuple[UUID, date], DailySchedule] = {}
 		self.task_completion_by_owner_date: dict[tuple[UUID, date, UUID], datetime | None] = {}
@@ -1848,6 +2047,34 @@ class PetCareApp:
 			agent_output.baseline_schedule,
 			agent_output.duration_ms,
 		)
+
+	def _build_candidate_from_schedule(self, schedule: DailySchedule) -> ScheduleCandidate:
+		"""Build a minimal candidate view from a concrete schedule for explanation grounding."""
+		reason_codes = tuple(schedule.planning_metadata.get("reason_codes", []))
+		return ScheduleCandidate(
+			proposed_items=list(schedule.items),
+			objective_score=float(len(schedule.items)),
+			rationale_summary="Derived from deterministic schedule state.",
+			planning_summary_metadata=dict(schedule.planning_metadata),
+			reason_codes=reason_codes,
+			generated_by=AgentRole.SCHEDULER,
+			advisory_only=AGENT_OUTPUTS_ADVISORY_ONLY,
+		)
+
+	def _apply_explanation_agent(
+		self,
+		context: PlanningContext,
+		candidate: ScheduleCandidate,
+		schedule: DailySchedule,
+	) -> DailySchedule:
+		"""Expand explanations after scheduling while preserving PlanExplanation list compatibility."""
+		schedule.explanations = self.explanation_agent.expand_explanations(
+			context=context,
+			candidate=candidate,
+			schedule=schedule,
+		)
+		self.scheduler_service.explanations_by_schedule_id[schedule.schedule_id] = schedule.explanations
+		return schedule
 
 	def _should_stop_retry(self, result: ValidationResult) -> bool:
 		"""Return True when retry loop should stop after a failed validation."""
@@ -1881,7 +2108,11 @@ class PetCareApp:
 				)
 				self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
 				self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
-				return baseline_schedule
+				return self._apply_explanation_agent(
+					context=context,
+					candidate=candidate,
+					schedule=baseline_schedule,
+				)
 
 			violation_codes = ", ".join(v.code for v in validation_result.violations) or "UNKNOWN"
 			loop_logs.append(
@@ -1916,7 +2147,12 @@ class PetCareApp:
 				fallback_schedule = self.scheduler_service.generate_daily_schedule(owner, schedule_date)
 				self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
 				self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
-				return fallback_schedule
+				fallback_candidate = self._build_candidate_from_schedule(fallback_schedule)
+				return self._apply_explanation_agent(
+					context=context,
+					candidate=fallback_candidate,
+					schedule=fallback_schedule,
+				)
 
 			loop_logs.append(f"Iteration {attempt + 1}: retry scheduled.")
 
@@ -1933,7 +2169,12 @@ class PetCareApp:
 		loop_logs.append("Deterministic fallback triggered after loop completion.")
 		self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
 		self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
-		return fallback_schedule
+		fallback_candidate = self._build_candidate_from_schedule(fallback_schedule)
+		return self._apply_explanation_agent(
+			context=context,
+			candidate=fallback_candidate,
+			schedule=fallback_schedule,
+		)
 
 	def create_owner_profile(self) -> Owner:
 		"""Create a new owner profile and register it with the application.
