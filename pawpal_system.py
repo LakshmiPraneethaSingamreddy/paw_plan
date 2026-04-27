@@ -356,6 +356,20 @@ class OrchestrationRetryConfig:
 
 
 @dataclass
+class PlanningLoopDiagnostic:
+	"""Diagnostics captured for each phase-5 planning loop step."""
+	attempt: int = 0
+	stage: str = ""
+	validation_status: Literal["pass", "fail"] = "pass"
+	violation_codes: tuple[str, ...] = ()
+	critique_summary: str = ""
+	repair_strategy: str = ""
+	repaired_validation_status: Literal["pass", "fail"] | None = None
+	fallback_used: bool = False
+	detail: str = ""
+
+
+@dataclass
 class PlanningContext:
 	"""Context assembled once per planning request for agent orchestration."""
 	owner_id: UUID
@@ -2031,6 +2045,7 @@ class PetCareApp:
 		self.planning_retry_config = OrchestrationRetryConfig()
 		self.planning_telemetry_by_owner_date: dict[tuple[UUID, date], list[AgentTelemetry]] = {}
 		self.planning_logs_by_owner_date: dict[tuple[UUID, date], list[str]] = {}
+		self.planning_loop_diagnostics_by_owner_date: dict[tuple[UUID, date], list[PlanningLoopDiagnostic]] = {}
 
 	def _build_planning_context(self, owner_id: UUID, owner: Owner, schedule_date: date) -> PlanningContext:
 		"""Build deterministic planning context for the orchestration loop."""
@@ -2061,6 +2076,147 @@ class PetCareApp:
 			advisory_only=AGENT_OUTPUTS_ADVISORY_ONLY,
 		)
 
+	def _annotate_repair_strategy(self, schedule: DailySchedule, strategy: str, detail: str = "") -> DailySchedule:
+		"""Tag repaired schedules with phase-5 metadata for observability and tests."""
+		schedule.planning_metadata = dict(schedule.planning_metadata)
+		schedule.planning_metadata["phase5_repair_strategy"] = strategy
+		if detail:
+			schedule.planning_metadata["phase5_repair_detail"] = detail
+		return schedule
+
+	def _build_validation_critique(self, validation_result: ValidationResult) -> str:
+		"""Summarize failed validation results for the repair loop."""
+		violation_codes = ", ".join(violation.code for violation in validation_result.violations) or "UNKNOWN"
+		messages = "; ".join(violation.message for violation in validation_result.violations) or "Validation failed without messages."
+		hints = " | ".join(validation_result.repair_hints) if validation_result.repair_hints else "No repair hints available."
+		return f"Violations [{violation_codes}]: {messages}. Repair hints: {hints}"
+
+	def _refresh_schedule_totals(self, schedule: DailySchedule) -> DailySchedule:
+		"""Recompute schedule totals after repairs mutate the item list."""
+		schedule.total_planned_min = sum(
+			int((item.end_time - item.start_time).total_seconds() // 60)
+			for item in schedule.items
+			if item.start_time is not None and item.end_time is not None
+		)
+		return schedule
+
+	def _apply_lightweight_repair(self, schedule: DailySchedule) -> DailySchedule:
+		"""Lightweight repair: regenerate invalid or overlapping items in place."""
+		schedule.regenerate()
+		return self._annotate_repair_strategy(schedule, "lightweight", "regenerate_invalid_and_overlapping_items")
+
+	def _apply_targeted_repair(
+		self,
+		schedule: DailySchedule,
+		owner: Owner,
+		schedule_date: date,
+	) -> DailySchedule:
+		"""Targeted repair: move flexible tasks into the earliest feasible open slots."""
+		day_windows, _ = self.scheduler_service._resolve_day_windows(owner, schedule_date)
+		if not day_windows:
+			return self._annotate_repair_strategy(schedule, "targeted", "no_day_windows_available")
+
+		ordered_items = [
+			item
+			for item in sorted(schedule.items, key=lambda scheduled_item: scheduled_item.start_time or datetime.min)
+			if item.task is not None and item.start_time is not None and item.end_time is not None
+		]
+		fixed_items = [item for item in ordered_items if not item.task.is_flexible]
+		flexible_items = [item for item in ordered_items if item.task.is_flexible]
+
+		repaired_items: list[ScheduleItem] = list(fixed_items)
+		flexible_items.sort(
+			key=lambda item: (
+				-(item.task.priority if item.task is not None else 0),
+				item.task.latest_end or time(hour=23, minute=59) if item.task is not None else time(hour=23, minute=59),
+				item.task.earliest_start or time(hour=0, minute=0) if item.task is not None else time(hour=0, minute=0),
+			)
+		)
+
+		for item in flexible_items:
+			if item.task is None:
+				continue
+			slot, _ = self.scheduler_service._find_earliest_slot(
+				item.task,
+				schedule_date,
+				day_windows,
+				repaired_items,
+			)
+			if slot is None:
+				repaired_items.append(item)
+				continue
+
+			start_dt, end_dt = slot
+			repaired_items.append(
+				replace(
+					item,
+					start_time=start_dt,
+					end_time=end_dt,
+					reason_code="REPAIRED_TARGETED_FLEX_MOVE",
+				)
+			)
+
+		schedule.items = sorted(repaired_items, key=lambda item: item.start_time or datetime.min)
+		self._refresh_schedule_totals(schedule)
+		return self._annotate_repair_strategy(schedule, "targeted", "rescheduled_flexible_items")
+
+	def _apply_structural_repair(self, owner: Owner, schedule_date: date) -> DailySchedule:
+		"""Structural repair: reschedule blocked segments using the deterministic baseline scheduler."""
+		repaired_schedule = self.scheduler_service.generate_daily_schedule(owner, schedule_date)
+		return self._annotate_repair_strategy(repaired_schedule, "structural", "recomputed_deterministic_schedule")
+
+	def _should_attempt_phase5_repair(self, candidate: ScheduleCandidate, validation_result: ValidationResult) -> bool:
+		"""Return True when the self-check loop should try repair strategies before retrying."""
+		if candidate.planning_summary_metadata.get("phase5_force_repair"):
+			return True
+
+		repairable_codes = {"NO_OVERLAP", "OUTSIDE_AVAILABILITY", "RIGID_START_WINDOW", "RIGID_END_WINDOW"}
+		return any(violation.code in repairable_codes for violation in validation_result.violations)
+
+	def _repair_schedule_candidate(
+		self,
+		owner: Owner,
+		schedule_date: date,
+		validation_result: ValidationResult,
+		baseline_schedule: DailySchedule,
+		loop_logs: list[str],
+		diagnostics: list[PlanningLoopDiagnostic],
+		attempt_number: int,
+	) -> tuple[ScheduleCandidate, DailySchedule, ValidationResult, str | None]:
+		"""Apply the phase-5 repair ladder until a repaired candidate validates or the ladder is exhausted."""
+		critique = self._build_validation_critique(validation_result)
+		current_schedule = baseline_schedule
+		for strategy_name in ("lightweight", "targeted", "structural"):
+			if strategy_name == "lightweight":
+				current_schedule = self._apply_lightweight_repair(current_schedule)
+			elif strategy_name == "targeted":
+				current_schedule = self._apply_targeted_repair(current_schedule, owner, schedule_date)
+			else:
+				current_schedule = self._apply_structural_repair(owner, schedule_date)
+
+			repaired_schedule = current_schedule
+			repaired_candidate = self._build_candidate_from_schedule(repaired_schedule)
+			repaired_result = validate_schedule_candidate(repaired_candidate, owner, schedule_date)
+			diagnostics.append(
+				PlanningLoopDiagnostic(
+					attempt=attempt_number,
+					stage="repair",
+					validation_status="pass" if repaired_result.passed else "fail",
+					violation_codes=tuple(violation.code for violation in repaired_result.violations),
+					critique_summary=critique,
+					repair_strategy=strategy_name,
+					repaired_validation_status="pass" if repaired_result.passed else "fail",
+					detail=f"{strategy_name} repair {'succeeded' if repaired_result.passed else 'did not satisfy validation'}.",
+				)
+			)
+			loop_logs.append(
+				f"Iteration {attempt_number}: repair strategy {strategy_name} {'passed' if repaired_result.passed else 'failed'} validation."
+			)
+			if repaired_result.passed:
+				return repaired_candidate, repaired_schedule, repaired_result, strategy_name
+
+		return self._build_candidate_from_schedule(baseline_schedule), baseline_schedule, validation_result, None
+
 	def _apply_explanation_agent(
 		self,
 		context: PlanningContext,
@@ -2080,24 +2236,46 @@ class PetCareApp:
 		"""Return True when retry loop should stop after a failed validation."""
 		if not result.repair_hints:
 			return True
-		return any(
-			violation.severity in self.planning_retry_config.stop_on_severities
+
+		repairable_critical_codes = {"NO_OVERLAP", "OUTSIDE_AVAILABILITY", "RIGID_START_WINDOW", "RIGID_END_WINDOW"}
+		critical_violations = [
+			violation
 			for violation in result.violations
-		)
+			if violation.severity in self.planning_retry_config.stop_on_severities
+		]
+		if not critical_violations:
+			return False
+		if any(violation.code not in repairable_critical_codes for violation in critical_violations):
+			return True
+
+		return False
 
 	def _orchestrate_daily_planning(self, owner_id: UUID, owner: Owner, schedule_date: date) -> DailySchedule:
-		"""Run the phase-1 orchestration loop around existing scheduler behavior."""
+		"""Run the phase-5 self-check loop around existing scheduler behavior."""
 		context = self._build_planning_context(owner_id=owner_id, owner=owner, schedule_date=schedule_date)
 		telemetry_entries: list[AgentTelemetry] = []
 		loop_logs: list[str] = []
+		diagnostics: list[PlanningLoopDiagnostic] = []
 
 		for attempt in range(self.planning_retry_config.max_retries + 1):
 			candidate, baseline_schedule, duration_ms = self._run_scheduler_agent_wrapper(context)
 			validation_result = validate_schedule_candidate(candidate, owner, schedule_date)
+			attempt_number = attempt + 1
+			critique = self._build_validation_critique(validation_result) if not validation_result.passed else "Candidate passed validation."
+			diagnostics.append(
+				PlanningLoopDiagnostic(
+					attempt=attempt_number,
+					stage="validate",
+					validation_status="pass" if validation_result.passed else "fail",
+					violation_codes=tuple(violation.code for violation in validation_result.violations),
+					critique_summary=critique,
+					detail="Initial candidate validation.",
+				)
+			)
 
 			if validation_result.passed:
 				loop_logs.append(
-					f"Iteration {attempt + 1}: candidate passed validation and was accepted."
+					f"Iteration {attempt_number}: candidate passed validation and was accepted."
 				)
 				telemetry_entries.append(
 					AgentTelemetry(
@@ -2108,6 +2286,7 @@ class PetCareApp:
 				)
 				self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
 				self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
+				self.planning_loop_diagnostics_by_owner_date[(owner_id, schedule_date)] = diagnostics
 				return self._apply_explanation_agent(
 					context=context,
 					candidate=candidate,
@@ -2116,21 +2295,106 @@ class PetCareApp:
 
 			violation_codes = ", ".join(v.code for v in validation_result.violations) or "UNKNOWN"
 			loop_logs.append(
-				f"Iteration {attempt + 1}: candidate failed validation with violations [{violation_codes}]."
+				f"Iteration {attempt_number}: candidate failed validation with violations [{violation_codes}]."
 			)
+			loop_logs.append(f"Iteration {attempt_number}: critique summary -> {critique}")
 
 			exhausted_retries = attempt >= self.planning_retry_config.max_retries
 			stop_retry = self._should_stop_retry(validation_result)
-			use_fallback = self.planning_retry_config.fallback_on_validation_failure and (exhausted_retries or stop_retry)
+			use_fallback = self.planning_retry_config.fallback_on_validation_failure and stop_retry
+
+			if not use_fallback and self._should_attempt_phase5_repair(candidate, validation_result):
+				repaired_candidate, repaired_schedule, repaired_result, repair_strategy = self._repair_schedule_candidate(
+					owner=owner,
+					schedule_date=schedule_date,
+					validation_result=validation_result,
+					baseline_schedule=baseline_schedule,
+					loop_logs=loop_logs,
+					diagnostics=diagnostics,
+					attempt_number=attempt_number,
+				)
+				if repaired_result.passed:
+					loop_logs.append(
+						f"Iteration {attempt_number}: repair strategy {repair_strategy} produced a valid schedule."
+					)
+					telemetry_entries.append(
+						AgentTelemetry(
+							agent_role=AgentRole.SCHEDULER,
+							retries=attempt,
+							duration_ms=duration_ms,
+						)
+					)
+					self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
+					self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
+					self.planning_loop_diagnostics_by_owner_date[(owner_id, schedule_date)] = diagnostics
+					return self._apply_explanation_agent(
+						context=context,
+						candidate=repaired_candidate,
+						schedule=repaired_schedule,
+					)
+
+				loop_logs.append(f"Iteration {attempt_number}: all repair strategies failed; retry scheduled.")
+				if exhausted_retries:
+					use_fallback = True
+					fallback_reason = "max_retries_exhausted"
+					diagnostics.append(
+						PlanningLoopDiagnostic(
+							attempt=attempt_number,
+							stage="fallback",
+							validation_status="fail",
+							violation_codes=tuple(violation.code for violation in validation_result.violations),
+							critique_summary=critique,
+							repair_strategy="fallback",
+							repaired_validation_status="fail",
+							fallback_used=True,
+							detail="Retry budget exhausted after repair ladder failure.",
+						)
+					)
+				else:
+					telemetry_entries.append(
+						AgentTelemetry(
+							agent_role=AgentRole.SCHEDULER,
+							retries=attempt,
+							duration_ms=duration_ms,
+						)
+					)
+					self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
+					self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
+					self.planning_loop_diagnostics_by_owner_date[(owner_id, schedule_date)] = diagnostics
+					continue
+
+			if not use_fallback and not exhausted_retries:
+				telemetry_entries.append(
+					AgentTelemetry(
+						agent_role=AgentRole.SCHEDULER,
+						retries=attempt,
+						duration_ms=duration_ms,
+					)
+				)
+				self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
+				self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
+				self.planning_loop_diagnostics_by_owner_date[(owner_id, schedule_date)] = diagnostics
+				loop_logs.append(f"Iteration {attempt_number}: retry scheduled.")
+				continue
 
 			fallback_reason = ""
 			if use_fallback:
-				if exhausted_retries:
-					fallback_reason = "max_retries_exhausted"
-				elif stop_retry:
-					fallback_reason = "stop_condition_triggered"
+				fallback_reason = "stop_condition_triggered"
 				loop_logs.append(
-					f"Iteration {attempt + 1}: deterministic fallback triggered ({fallback_reason})."
+					f"Iteration {attempt_number}: deterministic fallback triggered ({fallback_reason})."
+				)
+				diagnostics.append(
+					PlanningLoopDiagnostic(
+						attempt=attempt_number,
+						stage="fallback",
+						validation_status="fail",
+						violation_codes=tuple(violation.code for violation in validation_result.violations),
+						critique_summary=critique,
+						repair_strategy="fallback",
+						repaired_validation_status="fail",
+						fallback_used=True,
+						detail="Validation failure triggered deterministic fallback before exhausting retries.",
+					)
 				)
 
 			telemetry_entries.append(
@@ -2147,6 +2411,7 @@ class PetCareApp:
 				fallback_schedule = self.scheduler_service.generate_daily_schedule(owner, schedule_date)
 				self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
 				self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
+				self.planning_loop_diagnostics_by_owner_date[(owner_id, schedule_date)] = diagnostics
 				fallback_candidate = self._build_candidate_from_schedule(fallback_schedule)
 				return self._apply_explanation_agent(
 					context=context,
@@ -2154,7 +2419,7 @@ class PetCareApp:
 					schedule=fallback_schedule,
 				)
 
-			loop_logs.append(f"Iteration {attempt + 1}: retry scheduled.")
+			loop_logs.append(f"Iteration {attempt_number}: retry scheduled.")
 
 		# Defensive fallback; loop should always return before this line.
 		fallback_schedule = self.scheduler_service.generate_daily_schedule(owner, schedule_date)
@@ -2169,6 +2434,7 @@ class PetCareApp:
 		loop_logs.append("Deterministic fallback triggered after loop completion.")
 		self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
 		self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
+		self.planning_loop_diagnostics_by_owner_date[(owner_id, schedule_date)] = diagnostics
 		fallback_candidate = self._build_candidate_from_schedule(fallback_schedule)
 		return self._apply_explanation_agent(
 			context=context,
