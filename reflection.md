@@ -30,7 +30,10 @@ The intial 3 core actions the user should be able to perform are
     2) I have added Petcare app class as the main interface, so that it will be the entry point where the owner interacts with the app.
     3) I have added Scheduling constraint, Daily schedule and schedule item classes so that the edits to the schedule are manageable.
     4) I have created a seperate PlanExplanation class, so that the explanation of why that plan has choosen will be transparent.
-    5) and lastly I also have included a careTask class, becuase a pet can have many tasks scheduled for that day and something needs to keep track of these.
+    5) I have included a CareTask class, becuase a pet can have many tasks scheduled for that day and something needs to keep track of these.
+    6) I have also added a multi-agent architecture with AgentRole, where each role like scheduler, explanation, and task management has a clear boundary and responsibility. This keeps things clean and makes it easier to extend later.
+    7) Finally I split the UI into seperate files like app.py, app_ui.py, app_helpers.py and app_agents.py so that the code is organized and not all in one place.
+
 ---
 
 ## 2. Scheduling Logic and Tradeoffs
@@ -39,7 +42,7 @@ The intial 3 core actions the user should be able to perform are
 
 - What constraints does your scheduler consider (for example: time, priority, preferences)?
 
-    For the scheduler I have taken the availabiltiy, priority and preferences of the owner into consideration.
+    For the scheduler I have taken the availabiltiy, priority and preferences of the owner into consideration. I have also added task category, flexibility, recurrence frequency and time windows (earliest start and latest end) as constraints so the scheduler knows exactly when each task can run.
 
 - How did you decide which constraints mattered most?
    
@@ -49,7 +52,7 @@ The intial 3 core actions the user should be able to perform are
 
 - Describe one tradeoff your scheduler makes.
 
-    The main tradeoff that my schedule makes is that if a task is **"low priority"** and is **"flexible"**, then it will first schedule the tasks that are high priority, then schedule the remaining tasks later, and if they can't fit in their requested time slot, since they are flexible they are pushed to the next available time slot.
+    The main tradeoff that my schedule makes is that if a task is **"low priority"** and is **"flexible"**, then it will first schedule the tasks that are high priority, then schedule the remaining tasks later, and if they can't fit in their requested time slot, since they are flexible they are pushed to the next available time slot. And on top of this I also have a AI based scheduler that tries to build the schedule, and if it fails within the retry budget, the rule-based fallback scheduler takes over and builds the schedule instead.
 
 - Why is that tradeoff reasonable for this scenario?
 
@@ -63,7 +66,7 @@ The intial 3 core actions the user should be able to perform are
 
 - How did you use AI tools during this project (for example: design brainstorming, debugging, refactoring)?
 
-    I used the AI tools for code writing, debugging, refactoring and test case generation during this project.
+    I used the AI tools for code writing, debugging, refactoring and test case generation during this project. I also actually integrated AI into the app itself through a LLMExplanationAgent that takes the rule-based plan explanations and rewrites them in a more human readable way when the user clicks the "Explain with AI" button.
 
 - What kinds of prompts or questions were most helpful?
 
@@ -73,7 +76,7 @@ The intial 3 core actions the user should be able to perform are
 
 - Describe one moment where you did not accept an AI suggestion as-is.
 
-    When I was asking questions on my UMl diagram and functionality of the app, it kept suggesting to add more features and classes. I mean that will be actually cool, if I add more functionality but it over complicates my app and I felt that in the long run it might get hard to actually complete the app since there any many things to work on my own. So, I did not accept that suggestions and I asked it to give me suggestions on exactly what I need and do not go outside of the scope of my problem.
+    When I was trying to integrate the scheduler with an LLM to support multi-mode schedule generation, where the app could use either the deterministic scheduler or the LLM to build the schedule, it raised so many errors. Copilot kept changing the code again and again but nothing was actually working and it was going in circles. So I had to stop the chat and made a hard decision to keep only the deterministic model for schedule generation and instead use the LLM just for generating a summary for the plan explanation. I kept the full LLM-based schedule generation as a future improvement because I felt that forcing it at that point was just breaking more things than it was fixing.
 
 - How did you evaluate or verify what the AI suggested?
 
@@ -87,7 +90,7 @@ The intial 3 core actions the user should be able to perform are
 
 - What behaviors did you test?
 
-    I have tested the functionalities that I want my app to perform. I have tested whether the user can enter/edit/delete their details, user can add/edit/remove their pets, if user can add multiple pets, the core scheduling and ordering of tasks, how recurrent tasks are generated, whether the availability and preferences are taken into consideration or not, schedule rengeration and conflict handling and how the schedule plan explanations are done.
+    I have tested the functionalities that I want my app to perform. I have tested whether the user can enter/edit/delete their details, user can add/edit/remove their pets, if user can add multiple pets, the core scheduling and ordering of tasks, how recurrent tasks are generated(daily, weekly, and custom recurrence like selected weekdays or every N days), whether the availability and preferences are taken into consideration or not, schedule regeneration and conflict handling, how the schedule plan explanations are done, task validation guardrails that reject invalid inputs and show repair hints, inline task editing and removal from the task list, and task completion tracking where completed tasks show strikethrough.
 
 - Why were these tests important?
 
@@ -96,7 +99,7 @@ The intial 3 core actions the user should be able to perform are
 
 - How confident are you that your scheduler works correctly?
 
-    I am highly confident that my scheduler works correctly because it is supported by a strong implementation strategy and rigorous testing. The combination of careful design decisions and comprehensive test coverage gives me confidence that the core functionality behaves reliably across expected scenarios.
+    I am highly confident that my scheduler works correctly because it is supported by a strong implementation strategy and rigorous testing. The combination of careful design decisions and comprehensive test coverage gives me confidence that the core functionality behaves reliably across expected scenarios. I also have a diagnostics panel built into the UI that shows how many scheduling attempts were made, how many retries happened, and whether the fallback was used, so I can actually see what the scheduler did internally.
 
 - What edge cases would you test next if you had more time?
 
@@ -110,16 +113,16 @@ The intial 3 core actions the user should be able to perform are
 
 - What part of this project are you most satisfied with?
 
-    I feel the project went very well overall, and I am most satisfied with the UI design and the functionality it delivers.
+    I feel the project went very well overall, and I am most satisfied with the UI design and the functionality it delivers. I am especially happy with the scheduler diagnostics panel and the AI explanation feature because they make the app feel more transparent and interactive. I mean, the user can actually see what the scheduler did and why it made those decisions, which I think is really cool.
 
 **b. What you would improve**
 
 - If you had another iteration, what would you improve or redesign?
 
-    I would improve the app by adding database integration so it becomes a true end-to-end system, with persistent user data storage instead of session-only state.
+    I would improve the app by adding database integration so it becomes a true end-to-end system, with persistent user data storage instead of session-only state. And I would also improve the AI scheduling so it handles more complex edge cases and doesn't need to fall back to the rule-based scheduler as often.
 
 **c. Key takeaway**
 
 - What is one important thing you learned about designing systems or working with AI on this project?
 
-    I learned that UML diagrams play a critical role in app development because they provide a clear roadmap of what needs to be built. They help keep the implementation focused, reduce scope drift, and prevent unnecessary complexity by guiding decisions throughout the project.
+    I learned that UML diagrams play a critical role in app development because they provide a clear roadmap of what needs to be built. They help keep the implementation focused, reduce scope drift, and prevent unnecessary complexity by guiding decisions throughout the project. And I also learned that integrating AI into an actual product is very different from just using AI to write code. You have to think about when the AI should run, what happens when it fails, and how to show the user what it did, which is something I had not thought about before.

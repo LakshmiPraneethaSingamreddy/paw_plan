@@ -1,200 +1,285 @@
 # PawPal+
 
-PawPal+ is a Streamlit-based pet care planning app that helps owners organize daily care tasks across one or more pets.
+> An intelligent pet care planning application that combines deterministic scheduling, multi-agent orchestration, and LLM-powered explanations to help pet owners never miss a feeding, walk, or vet visit.
 
-The app combines task management, scheduling rules, recurrence support, and plan explainability to create practical day-by-day care plans.
+---
 
-## Demo
+## Original Project (Modules 1–3)
 
-PawPal+ provides an intuitive Streamlit interface for managing pet care across multiple pets with intelligent scheduling:
+The original project — **PawPal** — was a straightforward pet care planner built around three core classes: `Owner`, `Pet`, and `Scheduler`. Its goals were simple: allow an owner to add or remove pets, manage care tasks per pet, and view a generated daily schedule at any point during the day. The scheduling logic was greedy and linear — tasks were placed in order of arrival without priority modeling, backtracking, or recurrence support. There was no validation layer, no conflict detection, and no explainability beyond a basic task list.
 
-**1. Owner Setup & Pet Management**  
+---
 
+## Title and Summary
+
+**PawPal+** extends the original concept into a production-ready scheduling system with intelligent multi-agent orchestration. It solves a real problem: pet care is repetitive, time-sensitive, and easy to forget — especially across multiple pets with competing schedules. PawPal+ generates daily care plans that respect owner availability, task priorities, and recurrence patterns, then explains *why* each task was placed or deferred in plain language. It matters because it removes the cognitive overhead of coordinating pet care, while the explainability layer builds trust in the automated schedule.
+
+## Walkthrough Video
+
+[PawPal+ Walkthrough Video](https://www.loom.com/share/cb63a893d9db4819a6af1292aa22272b)
+
+
+
+---
+
+**Live demo screenshots:**
+
+**1. Owner Setup & Pet Management**
+*Register an owner with availability windows that constrain when tasks can be scheduled.*
 ![Owner Setup & Pet Management](assets/01-owner-setup.png)
-Set owner preferences, configure weekly availability windows, and add/manage multiple pets with detailed profiles.
 
-
-**2. Pet Setup** 
-
+**2. Pet Profiles**
+*Add pets with species and age — used to personalise task suggestions and explanations.*
 ![Pet Setup](assets/02-pet-setup.png)
-Add, edit, and remove pets with profile details (name, species, age, height, and weight).
 
+**3. Task Creation & Management**
+*Create care tasks with priority, duration, time windows, and recurrence rules.*
+![Task Creation](assets/task-creation.png)
+*View, edit, and remove tasks across all pets from a single management panel.*
+![Task Management](assets/task-management.png)
 
-**3. Task Creation & Management** 
+**4. Intelligent Daily Scheduling & Explanations**
+*The scheduler places tasks greedily by priority, respects rigid windows, and pushes flexible tasks to the next available slot rather than dropping them.*
+![Schedule Generation & Plan Explanation](assets/schedule-generation-and-plan-explanation.png)
+*Plain-language explanation of each scheduling decision, enhanced by gpt-4o-mini when an API key is provided.*
+![Plan Explanation with LLM](assets/plan-explanation-with-LLM.png)
+*Diagnostics panel showing repair steps taken, conflicts detected, and tasks deferred.*
+![Scheduler Diagnostics](assets/scheduler-diagnostics.png)
 
-![Task Creation & Management](assets/03-task-management.png)
-Create tasks with recurrence patterns (daily, weekly, custom), time windows, priorities, and flexibility. View, filter, and edit tasks in a structured table.
+---
 
+## Architecture Overview
 
-**4. Intelligent Daily Scheduling & Explanations** 
+PawPal+ is organized into five layers that compose to form the full system:
 
-![Daily Scheduling & Explanations](assets/04-schedule-and-explanations.png)
-Generate daily schedules, track completion, detect conflicts, and review plan explanations for why tasks were placed, deferred, or skipped.
-
-## Features
-
-## Phase 0: Architecture Contracts and Safety Baseline
-
-This section defines the non-negotiable architecture contract before agent orchestration is introduced.
-
-### Agent roles and responsibilities
-
-1. **Scheduler Agent**
-   - Proposes a `ScheduleCandidate` for the requested day.
-   - Does not mutate persisted owner/pet/task state.
-
-2. **Explanation Agent**
-   - Explains why a candidate is valid and why it was chosen.
-   - References ordering, constraints, and tradeoffs.
-
-3. **Task Management Agent**
-   - Validates incoming pet/task payloads prior to persistence.
-   - Repairs malformed inputs using deterministic repair hints.
-
-### Shared schemas
-
-1. **`ScheduleCandidate`**
-   - `candidate_id`, `proposed_items`, `objective_score`, `rationale_summary`, `generated_by`, `advisory_only`
-
-2. **`ValidationResult`**
-   - `status` (`pass` / `fail`)
-   - `violations` (each with code, message, severity, and repair hint)
-   - `repair_hints` (aggregated deterministic guidance)
-
-3. **`AgentTelemetry`**
-   - `run_id`, `agent_role`, `retries`, `fallback_reason`, `duration_ms`, `used_deterministic_fallback`
-
-### Hard constraints (guardrails)
-
-1. No overlap in final schedule.
-2. Non-flexible tasks must satisfy task time windows.
-3. Owner availability windows must be honored.
-4. Retry budget must be enforced with deterministic fallback.
-
-### Deterministic source of truth
-
-1. Existing scheduler logic (`SchedulerService.generate_daily_schedule`) remains the final authority.
-2. Agent outputs are advisory only until validated.
-
-### Deterministic fallback policy
-
-1. Retry each agent call up to a fixed budget (`AGENT_RETRY_BUDGET = 2`).
-2. If validation still fails, bypass advisory agent output.
-3. Use deterministic scheduler output as the final returned schedule.
-
-### Product capabilities
-
-1. **Owner + pet profile management**
-   - Create and edit owner profile settings (timezone, preferences, notification lead).
-   - Add, edit, and remove pets with species and basic physical details.
-
-2. **Task lifecycle management (CRUD)**
-   - Add, edit, and remove care tasks per pet.
-   - Capture category, duration, priority, flexibility, time bounds, and notes.
-
-3. **Recurrence-aware planning**
-   - Support task frequencies: `DAILY`, `WEEKLY`, and `CUSTOM`.
-   - Weekly recurrence uses a target weekday.
-   - Custom recurrence supports selected weekdays or every-N-days interval with an anchor date.
-
-4. **Daily schedule generation + explanations**
-   - Generate a day plan from all pets/tasks for the selected date.
-   - Return schedule explanations describing why tasks were placed, deferred, or skipped.
-
-5. **Interactive schedule execution tracking**
-   - Mark scheduled items complete/incomplete from the UI.
-   - Completion timestamps are recorded and completion state is preserved across same-day schedule regeneration.
-
-6. **Task visibility and conflict awareness**
-   - Filter task views by pet and flexibility.
-   - Sort task lists and scheduled items chronologically for stable display.
-   - Detect overlapping schedule items and show conflict warnings/suggested fixes.
-
-### Scheduling algorithms implemented
-
-1. **Window-aware greedy placement**
-   - Tasks are placed in the earliest feasible non-overlapping slot inside owner availability windows.
-
-2. **Priority + rigidity ordering**
-   - Candidate tasks are ordered with non-flexible tasks first, then higher priority, then tighter time bounds.
-
-3. **Backtracking with deferral/removal strategy**
-   - If no slot is found, the scheduler first defers lower-priority flexible tasks.
-   - If still blocked, it removes lower-priority rigid tasks as a last resort.
-
-4. **Flexible overflow handling**
-   - Flexible tasks may be scheduled after their preferred deadline when no pre-deadline gap exists (but still within availability).
-
-5. **Constraint filtering layer**
-   - Hard constraints are validated against candidate tasks before placement.
-   - Owner preference `avoid_late_night` is enforced during filtering.
-
-6. **Post-processing and observability**
-   - `DailySchedule.regenerate()` validates items, removes invalid entries, and adjusts non-locked overlaps.
-   - Planning summary and per-task reason codes improve explainability/debuggability.
-
-## Phase 6: Shared Retrieval for Explanation Grounding and Advisory Hints
-
-This project now combines the original phase 6 and phase 7 plans into one shared retrieval layer.
-
-### What the retrieval layer does
-
-1. Builds a small local corpus from owner preferences, recent schedule outcomes, policy snippets, and recurring routine patterns.
-2. Chunks each stored snippet into smaller queryable units before ranking and retrieves top-k matches with source attribution.
-3. Falls back to no match when retrieval confidence is too low, so the system can stay deterministic instead of forcing weak context.
-4. Grounds the Explanation Agent first, then reuses the same retrieval hints for suggestion-level task normalization and scheduler advisory metadata.
-5. Keeps the final schedule acceptance path deterministic and validator-gated.
-
-### Guardrails
-
-1. Explanation text must be supported by schedule state or retrieved snippets.
-2. Non-trivial claims without attribution are rejected from the explanation output.
-3. Retrieval can suggest corrections and heuristics, but it cannot override the deterministic scheduler or validation rules.
-
-## Getting started
-
-### Setup
-
-```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Streamlit UI Layer                    │
+│   app.py  ·  app_ui.py  ·  app_helpers.py               │
+└────────────────────────┬────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────┐
+│               Multi-Agent Orchestration                  │
+│   PetCareApp  ·  DeterministicSchedulerAgent             │
+│   TaskManagementAgent  ·  DeterministicExplanationAgent  │
+└────────────────────────┬────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────┐
+│             Deterministic Scheduling Engine              │
+│   SchedulerService  ·  window-aware greedy placement     │
+│   priority ordering  ·  backtracking + deferral          │
+└────────────────────────┬────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────┐
+│              Retrieval & Grounding Layer                 │
+│   LocalRetrievalCorpus  ·  BM25-style scoring            │
+│   source attribution  ·  snippet-based context           │
+└────────────────────────┬────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────┐
+│                  LLM Enhancement Layer                   │
+│   LLMExplanationAgent  ·  OpenAI API (gpt-4o-mini)       │
+│   graceful degradation  ·  deterministic fallback        │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### Testing PawPal+
+![UML Diagram](assets/uml-diagram.png)
 
-**Run tests with:**
+**Key architectural principle:** The deterministic scheduler is always the source of truth. Agent outputs are advisory only and must pass validation before affecting the final schedule. If the LLM is unavailable or produces invalid output, the system falls back to the deterministic schedule automatically — the app never breaks.
 
+**File responsibilities at a glance:**
+
+| File | Role |
+|---|---|
+| `pawpal_system.py` | Core domain models, scheduling engine, agent orchestration, validation, retrieval |
+| `app.py` | Streamlit entry point, session state management, page layout |
+| `app_ui.py` | UI rendering: task management, schedule display, conflict detection |
+| `app_helpers.py` | Formatting, filtering, sorting, and guardrail feedback helpers |
+| `app_agents.py` | LLM explanation enhancement integration point |
+| `llm_agents.py` | OpenAI API wrapper with error handling and graceful degradation |
+| `llm_config.py` | LLM provider config, prompt templates, environment variable management |
+
+---
+
+## Setup Instructions
+
+**Prerequisites:** Python 3.10+, an OpenAI API key (optional — the app works fully without it)
+
+```bash
+# 1. Clone the repository
+git clone <your-repo-url>
+cd paw_plan_AI
+
+# 2. Create and activate a virtual environment
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. (Optional) Set your OpenAI API key for AI-enhanced explanations
+#    Without this, the app runs fully on deterministic explanations
+export OPENAI_API_KEY=your_key_here       # macOS / Linux
+set OPENAI_API_KEY=your_key_here          # Windows CMD
+$env:OPENAI_API_KEY="your_key_here"       # Windows PowerShell
+
+# 5. Run the app
+streamlit run app.py
+```
+
+Open [http://localhost:8501](http://localhost:8501) in your browser.
+
+**Run tests:**
 ```bash
 python -m pytest
 ```
 
-**Current test coverage includes:**
+---
 
-1. **Task CRUD and completion flow**
-	- Verifies task creation and completion state persistence.
-	- Validates completion-related error handling paths.
+## Sample Interactions
 
-2. **Core scheduling behavior and ordering**
-	- Ensures tasks are scheduled within expected time bounds.
-	- Confirms deterministic chronological ordering.
+### Example 1: Flexible Task Gets Deferred — Morning Walk
 
-3. **Priority, backtracking, deferral, and flexibility behavior**
-	- Validates contention handling under limited schedule capacity.
-	- Confirms high-priority rigid task preference and flexible-task deferral.
+**Setup:**
+- Owner "Jordan" is available Monday–Friday, 8:00 AM – 8:00 PM
+- Pet: Mochi (dog, 2 years)
+- Tasks for Monday:
+  - Breakfast feeding — 20 min, high priority, non-flexible, window 8:00–10:00 AM
+  - Vet appointment — 90 min, high priority, non-flexible, window 2:00–4:00 PM
+  - Morning walk — 30 min, medium priority, flexible, preferred window 8:00–10:00 AM
 
-4. **Recurrence rules**
-	- Verifies daily, weekly, and custom recurrence behavior.
-	- Covers interval-based and weekday-based custom rules.
+**Generated schedule:**
 
-5. **Availability and constraint filtering**
-	- Ensures owner availability and preferences are enforced.
-	- Validates hard constraint filtering before final placement.
+| Time | Task | Status |
+|---|---|---|
+| 8:00 – 8:20 AM | Breakfast feeding | Scheduled (rigid) |
+| 8:20 – 8:50 AM | Morning walk | Deferred (pushed past preferred window) |
+| 2:00 – 3:30 PM | Vet appointment | Scheduled (rigid) |
 
-6. **Schedule regeneration and conflict handling**
-	- Confirms overlap adjustment and invalid-item cleanup.
-	- Checks lock-aware behavior during regeneration.
+**Explanation output:**
+> "Breakfast feeding was placed at 8:00 AM as the first available slot. The morning walk was requested for 8:00–10:00 AM, but after placing feeding only 10 minutes remained before 8:20 AM. Since the morning walk is flexible, it was shifted to 8:20 AM — still within your availability window. The vet appointment was locked into its 2:00 PM window as a non-flexible task."
 
-7. **Explanations and observability**
-	- Verifies planning outputs include meaningful explanations and reason codes.
-	- Confirms explainability behavior for non-trivial planning outcomes.
+---
+
+### Example 2: Conflict Detection — Two High-Priority Overlapping Tasks
+
+**Setup:**
+- Owner "Alex", available 9:00 AM – 6:00 PM
+- Pet: Biscuit (cat, 5 years)
+- Tasks:
+  - Medication — 15 min, high priority, non-flexible, window 9:00–9:30 AM
+  - Grooming session — 60 min, medium priority, flexible, window 9:00–11:00 AM
+
+**Generated schedule:**
+
+| Time | Task | Notes |
+|---|---|---|
+| 9:00 – 9:15 AM | Medication | Placed first (higher priority, non-flexible) |
+| 9:15 – 10:15 AM | Grooming session | Shifted 15 minutes — no conflict |
+
+**Conflict detection output (if user manually overrides times):**
+> "Warning: Grooming session (9:00–10:00 AM) overlaps with Medication (9:00–9:15 AM) by 15 minutes. Suggested fix: move Grooming session to 9:15 AM since it is flexible."
+
+---
+
+### Example 3: AI-Enhanced Explanation (with OpenAI enabled)
+
+**Raw deterministic explanation:**
+```
+PLACED at 08:00 | reason=EARLIEST_SLOT | priority=HIGH | rigid=True
+DEFERRED at 08:20 | reason=NO_SLOT_IN_WINDOW | flexible=True | overflow=True
+PLACED at 14:00 | reason=WINDOW_CONSTRAINED | priority=HIGH | rigid=True
+```
+
+**AI-enhanced explanation (gpt-4o-mini):**
+> "Your day starts with Mochi's breakfast at 8 AM — right on schedule. The morning walk got bumped to 8:20 AM because feeding needed that first slot, but since walks are flexible I found the next open gap so nothing was skipped. The vet appointment is locked in at 2 PM as planned. You're all set for a smooth Monday!"
+
+---
+
+## Design Decisions
+
+### 1. Deterministic scheduler as the source of truth
+LLM outputs are advisory only. The `SchedulerService` always produces a valid schedule that the validation layer signs off on before anything is shown to the user. This prevents the UI from ever breaking due to an LLM timeout, hallucination, or rate-limit error.
+
+*Trade-off:* The explanations from the deterministic engine are more mechanical ("PLACED at 08:00 | reason=EARLIEST_SLOT") until the optional LLM enhancement runs. This was intentional — correctness over polish.
+
+### 2. Three-tier repair ladder instead of hard failure
+When the scheduler produces a candidate with violations, it doesn't immediately fail. It climbs a repair ladder:
+1. **Lightweight repair** — regenerate with the same inputs
+2. **Targeted repair** — move flexible tasks to open slots
+3. **Structural repair** — recompute from scratch
+
+This means the user almost never sees an empty schedule — the system resolves conflicts internally.
+
+*Trade-off:* The repair logic adds complexity. A simpler "fail and show error" approach would be easier to debug, but would surface internal scheduling tension directly to the user rather than resolving it automatically.
+
+### 3. Retrieval layer for explanation grounding
+A local BM25-style retrieval corpus is built from owner preferences, recent schedule outcomes, and policy snippets. The `DeterministicExplanationAgent` queries this corpus to ground its claims before they're presented to the user. Non-trivial claims without retrieval support are rejected.
+
+*Trade-off:* This makes explanations more trustworthy but adds latency on first schedule generation. A simpler system would skip grounding and just narrate what the scheduler did.
+
+### 4. Flexible overflow instead of task dropping
+Flexible tasks that can't fit in their preferred time window are pushed to the next available slot within owner availability — they are never silently dropped.
+
+*Trade-off:* A task might be scheduled later than the owner wanted, which could feel like it defeated the purpose of the time window. The alternative (dropping the task) seemed worse — the owner would lose visibility entirely.
+
+### 5. In-memory state (no database)
+All owner, pet, task, and schedule data lives in Streamlit session state. This was a deliberate scope decision to stay focused on the scheduling and AI features during development.
+
+*Trade-off:* Data is lost on page refresh. A real product would need database integration — this is the top-priority next step.
+
+---
+
+## Testing Summary
+
+**What worked well:**
+
+- **Core scheduling logic** was the most thoroughly tested area. Priority ordering, backtracking, deferral, and flexible overflow all behave as expected across a wide range of task combinations.
+- **Recurrence rules** (daily, weekly, custom interval, custom weekday-based) were validated end-to-end and edge cases like anchor-date arithmetic were caught early through automated tests.
+- **Validation guardrails** for task creation (zero-duration tasks, invalid time windows, contradictory recurrence rules) surface clear error messages with repair hints that guided me to fix real bugs in the input forms.
+- **Schedule regeneration** preserves completion state correctly — a task marked complete at 9 AM stays complete after re-generating the schedule at noon.
+
+**What was harder to verify:**
+
+- **LLM explanation quality** is subjective. The automated tests verify that the agent calls the API and returns a string, but cannot assert that the explanation is actually helpful or accurate. Manual review was required.
+- **Retrieval grounding** was difficult to test comprehensively because the corpus is built dynamically from session state. Unit tests covered the BM25 scoring logic but end-to-end retrieval quality required manual inspection.
+- **Edge cases in backtracking** with three or more competing rigid tasks needed careful manual scenario construction — the automated test suite covers the most important permutations but not all possible orderings.
+
+**Key lessons:**
+
+- Writing test cases *before* implementing the repair ladder forced me to define what "valid" meant precisely, which caught two logic errors in the overlap-detection code before they reached the UI.
+- The AI (Claude Code and Github copilot) were useful for generating test scaffolding quickly, but every generated test had to be reviewed — some tested the wrong behavior or made assumptions about internal state that didn't match the actual implementation.
+- Testing UI behavior (Streamlit session state interactions) required manual testing because unit tests can't fully simulate user interaction flows.
+
+---
+
+## Reflection
+
+Building PawPal+ taught me that **the hardest part of building AI-assisted systems is deciding when not to use the AI.** The first instinct is to route everything through an LLM — scheduling, validation, explanations, conflict resolution. But each LLM call introduces latency, cost, and potential failure. The turning point in this project was committing to the principle that the deterministic scheduler is always right, and the LLM is always advisory. That single decision made the entire system more reliable and easier to reason about.
+
+On the AI collaboration side, I learned that **clear, scoped prompts produce better results than open-ended ones.** Early in the project, asking "what should I add to this app?" produced suggestions that would have tripled the scope. Asking "given this specific scheduling constraint, what's the simplest data structure to represent it?" produced something I could actually use. The AI is most valuable when I already know what I'm trying to accomplish and need help with *how* — not when I'm asking it to define the *what* for me.
+
+The UML design phase also turned out to matter more than I expected. The initial three-class model (Owner, Pet, Scheduler) was too coarse — it caused the Scheduler class to accumulate responsibilities that belonged elsewhere. Breaking out `OwnerPreference`, `AvailabilityWindow`, `CareTask`, `ScheduleItem`, `DailySchedule`, and `PlanExplanation` as separate entities made the codebase dramatically easier to extend. The lesson: investing time in design pays off in proportion to how long you spend on the implementation that follows it.
+
+Finally, building explainability in from the start — not as a post-hoc feature — shaped the entire architecture. Having the scheduler emit reason codes (`PLACED`, `DEFERRED`, `NO_SLOT_IN_WINDOW`) for every decision made debugging faster, made the retrieval grounding layer possible, and made the LLM enhancement layer straightforward to wire in. Systems that explain themselves are easier to trust, easier to test, and easier to hand off.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| UI | Streamlit |
+| Language | Python 3.10+ |
+| LLM API | OpenAI (gpt-4o-mini) |
+| Retrieval | Custom BM25-style local corpus |
+| Testing | pytest |
+| State management | Streamlit session state |
+
+---
+
