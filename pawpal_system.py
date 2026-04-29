@@ -774,9 +774,59 @@ class SchedulingConstraint:
 
 
 class TaskManagementAgent:
-	"""Validates task payloads before persistence and emits deterministic repair hints."""
+	"""Validates task payloads before persistence and emits deterministic repair hints.
+
+	Optionally accepts a retrieval corpus so the agent can augment failed validation
+	results with grounded hints from owner routines and policy snippets (Phase 7).
+	"""
 
 	DEFAULT_REPAIR_DURATION_MIN = 15
+
+	_REPAIRABLE_CODES: frozenset[str] = frozenset({
+		"INVALID_DURATION",
+		"INVALID_TIME_WINDOW",
+		"INCOHERENT_RECURRENCE_DAILY",
+		"INCOHERENT_RECURRENCE_WEEKLY_DAY",
+		"INCOHERENT_RECURRENCE_WEEKLY_EXTRA",
+		"INCOHERENT_RECURRENCE_CUSTOM_DAY_RANGE",
+		"INCOHERENT_RECURRENCE_CUSTOM_INTERVAL",
+		"INCOHERENT_RECURRENCE_CUSTOM_MODE",
+		"INCOHERENT_RECURRENCE_CUSTOM_MISSING",
+		"INCOHERENT_RECURRENCE_CUSTOM_ANCHOR",
+		"INCOHERENT_RECURRENCE_CUSTOM_INTERVAL_MISSING",
+	})
+
+	def __init__(self, retrieval_corpus: "LocalRetrievalCorpus | None" = None) -> None:
+		self.retrieval_corpus = retrieval_corpus
+
+	def augment_validation_with_retrieval(
+		self,
+		task: CareTask,
+		validation_result: ValidationResult,
+	) -> ValidationResult:
+		"""Append retrieval-grounded hints to a failed validation result (Phase 7).
+
+		No-ops when no corpus is configured or the result already passed.
+		"""
+		if self.retrieval_corpus is None or validation_result.passed:
+			return validation_result
+
+		query = (
+			f"{task.title} {task.category.value} {task.frequency.value} "
+			f"{' '.join(validation_result.repair_hints)}"
+		)
+		retrieved_snippets = self.retrieval_corpus.retrieve(query=query, top_k=2)
+		routine_snippets = [s for s in retrieved_snippets if s.source_type == "routine"]
+		if routine_snippets:
+			validation_result.repair_hints.append(
+				f"Normalization suggestion from retrieval: align this task with "
+				f"{routine_snippets[0].attribution} -> {routine_snippets[0].content}."
+			)
+		for snippet in retrieved_snippets:
+			hint = f"Retrieved correction hint from {snippet.attribution}: {snippet.content}"
+			if hint not in validation_result.repair_hints:
+				validation_result.repair_hints.append(hint)
+		return validation_result
 
 	def validate_task_payload(
 		self,
@@ -1044,6 +1094,86 @@ class TaskManagementAgent:
 			suggested = end_of_day
 		return suggested.time()
 
+	def repair_task_payload(self, task: CareTask, violations: list[ValidationViolation]) -> CareTask:
+		"""Return a copy of task with all repairable violations auto-corrected."""
+		patched: dict[str, Any] = {}
+		codes = {v.code for v in violations}
+
+		if "INVALID_DURATION" in codes:
+			patched["duration_min"] = self.DEFAULT_REPAIR_DURATION_MIN
+
+		if "INVALID_TIME_WINDOW" in codes and task.earliest_start is not None:
+			dur = patched.get("duration_min", task.duration_min)
+			patched["latest_end"] = self._suggest_nearest_valid_end(task.earliest_start, dur)
+
+		self._repair_recurrence(task, patched, codes)
+		return replace(task, **patched)
+
+	def _repair_recurrence(
+		self, task: CareTask, patched: dict[str, Any], codes: set[str]
+	) -> None:
+		"""Apply recurrence-specific mutations to patched, given violation codes."""
+		if "INCOHERENT_RECURRENCE_DAILY" in codes:
+			patched.update(
+				weekly_day_of_week=None,
+				custom_days_of_week=[],
+				custom_interval_days=None,
+				custom_anchor_date=None,
+			)
+			return
+
+		if "INCOHERENT_RECURRENCE_WEEKLY_DAY" in codes:
+			patched["weekly_day_of_week"] = task.created_on.weekday()
+		if "INCOHERENT_RECURRENCE_WEEKLY_EXTRA" in codes:
+			patched.update(
+				custom_days_of_week=[],
+				custom_interval_days=None,
+				custom_anchor_date=None,
+			)
+
+		custom_codes = codes & {
+			"INCOHERENT_RECURRENCE_CUSTOM_DAY_RANGE",
+			"INCOHERENT_RECURRENCE_CUSTOM_INTERVAL",
+			"INCOHERENT_RECURRENCE_CUSTOM_MODE",
+			"INCOHERENT_RECURRENCE_CUSTOM_MISSING",
+			"INCOHERENT_RECURRENCE_CUSTOM_ANCHOR",
+			"INCOHERENT_RECURRENCE_CUSTOM_INTERVAL_MISSING",
+		}
+		if not custom_codes:
+			return
+
+		if "INCOHERENT_RECURRENCE_CUSTOM_MODE" in codes:
+			# Both weekday and interval modes are set; prefer weekday, drop interval.
+			patched["custom_interval_days"] = None
+			patched["custom_anchor_date"] = None
+			return
+
+		if "INCOHERENT_RECURRENCE_CUSTOM_MISSING" in codes:
+			# No mode configured; default to every-day interval.
+			patched["custom_interval_days"] = 1
+			patched["custom_anchor_date"] = task.created_on
+			return
+
+		if "INCOHERENT_RECURRENCE_CUSTOM_DAY_RANGE" in codes:
+			clamped = [d for d in task.custom_days_of_week if 0 <= d <= 6]
+			if clamped:
+				patched["custom_days_of_week"] = clamped
+			else:
+				# All days were out-of-range; pivot to every-day interval mode.
+				patched.update(
+					custom_days_of_week=[],
+					custom_interval_days=1,
+					custom_anchor_date=task.created_on,
+				)
+				return
+
+		if "INCOHERENT_RECURRENCE_CUSTOM_INTERVAL" in codes:
+			patched["custom_interval_days"] = 1
+		if "INCOHERENT_RECURRENCE_CUSTOM_ANCHOR" in codes:
+			patched["custom_anchor_date"] = task.created_on
+		if "INCOHERENT_RECURRENCE_CUSTOM_INTERVAL_MISSING" in codes:
+			patched["custom_interval_days"] = 1
+
 
 @dataclass
 class Owner:
@@ -1123,14 +1253,24 @@ class Owner:
 		if task.task_id in self.task_to_pet:
 			raise ValueError("Task with this ID already exists")
 
-		validation_result = TaskManagementAgent().validate_task_payload(
+		agent = TaskManagementAgent()
+		validation_result = agent.validate_task_payload(
 			owner=self,
 			pet_id=pet_id,
 			task=task,
 			existing_task_id=None,
 		)
 		if not validation_result.passed:
-			raise TaskValidationError(validation_result)
+			if all(v.code in agent._REPAIRABLE_CODES for v in validation_result.violations):
+				task = agent.repair_task_payload(task, validation_result.violations)
+				validation_result = agent.validate_task_payload(
+					owner=self,
+					pet_id=pet_id,
+					task=task,
+					existing_task_id=None,
+				)
+			if not validation_result.passed:
+				raise TaskValidationError(validation_result)
 
 		pet.tasks.append(task)
 		self.task_to_pet[task.task_id] = pet_id
@@ -1154,7 +1294,7 @@ class Owner:
 		if pet is None:
 			raise ValueError("Inconsistent task index: pet not found")
 
-		for task in pet.tasks:
+		for idx, task in enumerate(pet.tasks):
 			if task.task_id == task_id:
 				candidate_task = replace(task)
 				for field_name, field_value in changes.items():
@@ -1164,17 +1304,26 @@ class Owner:
 						raise AttributeError(f"Unknown task field: {field_name}")
 					setattr(candidate_task, field_name, field_value)
 
-				validation_result = TaskManagementAgent().validate_task_payload(
+				agent = TaskManagementAgent()
+				validation_result = agent.validate_task_payload(
 					owner=self,
 					pet_id=pet_id,
 					task=candidate_task,
 					existing_task_id=task_id,
 				)
 				if not validation_result.passed:
-					raise TaskValidationError(validation_result)
+					if all(v.code in agent._REPAIRABLE_CODES for v in validation_result.violations):
+						candidate_task = agent.repair_task_payload(candidate_task, validation_result.violations)
+						validation_result = agent.validate_task_payload(
+							owner=self,
+							pet_id=pet_id,
+							task=candidate_task,
+							existing_task_id=task_id,
+						)
+					if not validation_result.passed:
+						raise TaskValidationError(validation_result)
 
-				for field_name, field_value in changes.items():
-					setattr(task, field_name, field_value)
+				pet.tasks[idx] = candidate_task
 				return
 
 		raise ValueError("Task not found")
@@ -2313,33 +2462,6 @@ class PetCareApp:
 		corpus = self._build_retrieval_corpus(owner, schedule_date)
 		return corpus.retrieve(query=query, top_k=top_k)
 
-	def _augment_task_validation_result(
-		self,
-		owner: Owner,
-		pet_id: UUID,
-		task: CareTask,
-		validation_result: ValidationResult,
-	) -> ValidationResult:
-		if validation_result.passed:
-			return validation_result
-
-		retrieved_snippets = self._retrieve_context_snippets(
-			owner=owner,
-			schedule_date=date.today(),
-			query=f"{task.title} {task.category.value} {task.frequency.value} {' '.join(validation_result.repair_hints)}",
-			top_k=2,
-		)
-		routine_snippets = [snippet for snippet in retrieved_snippets if snippet.source_type == "routine"]
-		if routine_snippets:
-			validation_result.repair_hints.append(
-				f"Normalization suggestion from retrieval: align this task with {routine_snippets[0].attribution} -> {routine_snippets[0].content}."
-			)
-		for snippet in retrieved_snippets:
-			hint = f"Retrieved correction hint from {snippet.attribution}: {snippet.content}"
-			if hint not in validation_result.repair_hints:
-				validation_result.repair_hints.append(hint)
-		return validation_result
-
 	def _run_scheduler_agent_wrapper(
 		self,
 		context: PlanningContext,
@@ -2382,6 +2504,27 @@ class PetCareApp:
 			generated_by=AgentRole.SCHEDULER,
 			advisory_only=AGENT_OUTPUTS_ADVISORY_ONLY,
 		)
+
+	def _build_schedule_from_candidate(self, candidate: ScheduleCandidate, baseline_schedule: DailySchedule) -> DailySchedule:
+		"""Materialize an accepted candidate into a concrete schedule for UI rendering."""
+		schedule = DailySchedule(
+			date=baseline_schedule.date,
+			status=baseline_schedule.status,
+			created_at=baseline_schedule.created_at,
+			items=list(candidate.proposed_items),
+			explanations=list(baseline_schedule.explanations),
+			planning_metadata=dict(baseline_schedule.planning_metadata),
+		)
+		schedule.total_planned_min = sum(
+			int((item.end_time - item.start_time).total_seconds() // 60)
+			for item in schedule.items
+			if item.start_time is not None and item.end_time is not None
+		)
+		if candidate.planning_summary_metadata:
+			schedule.planning_metadata.update(candidate.planning_summary_metadata)
+		if candidate.rationale_metadata:
+			schedule.planning_metadata.setdefault("rationale_metadata", dict(candidate.rationale_metadata))
+		return schedule
 
 	def _annotate_repair_strategy(self, schedule: DailySchedule, strategy: str, detail: str = "") -> DailySchedule:
 		"""Tag repaired schedules with phase-5 metadata for observability and tests."""
@@ -2601,10 +2744,11 @@ class PetCareApp:
 				self.planning_telemetry_by_owner_date[(owner_id, schedule_date)] = telemetry_entries
 				self.planning_logs_by_owner_date[(owner_id, schedule_date)] = loop_logs
 				self.planning_loop_diagnostics_by_owner_date[(owner_id, schedule_date)] = diagnostics
+				final_schedule = self._build_schedule_from_candidate(candidate, baseline_schedule)
 				return self._apply_explanation_agent(
 					context=context,
 					candidate=candidate,
-					schedule=baseline_schedule,
+					schedule=final_schedule,
 				)
 
 			violation_codes = ", ".join(v.code for v in validation_result.violations) or "UNKNOWN"
@@ -2795,10 +2939,21 @@ class PetCareApp:
 		if owner is None:
 			raise ValueError("Owner not found")
 
+		corpus = self._build_retrieval_corpus(owner, date.today())
+		agent = TaskManagementAgent(retrieval_corpus=corpus)
+		validation_result = agent.validate_task_payload(
+			owner=owner,
+			pet_id=pet_id,
+			task=task,
+			existing_task_id=None,
+		)
+		if not validation_result.passed:
+			agent.augment_validation_with_retrieval(task, validation_result)
+			raise TaskValidationError(validation_result)
 		try:
 			owner.add_task(pet_id, task)
 		except TaskValidationError as exc:
-			self._augment_task_validation_result(owner, pet_id, task, exc.result)
+			agent.augment_validation_with_retrieval(task, exc.result)
 			raise TaskValidationError(exc.result) from None
 		return ValidationResult(status="pass")
 
@@ -2808,21 +2963,33 @@ class PetCareApp:
 		if owner is None:
 			raise ValueError("Owner not found")
 
+		corpus = self._build_retrieval_corpus(owner, date.today())
+		agent = TaskManagementAgent(retrieval_corpus=corpus)
+		pet_id = owner.task_to_pet.get(task_id)
+		original_pet = owner._get_pet_by_id(pet_id) if pet_id is not None else None
+		candidate_task = None
+		if original_pet is not None:
+			for existing_task in original_pet.tasks:
+				if existing_task.task_id == task_id:
+					candidate_task = replace(existing_task)
+					for field_name, field_value in changes.items():
+						setattr(candidate_task, field_name, field_value)
+					break
+		if candidate_task is not None:
+			validation_result = agent.validate_task_payload(
+				owner=owner,
+				pet_id=pet_id,
+				task=candidate_task,
+				existing_task_id=task_id,
+			)
+			if not validation_result.passed:
+				agent.augment_validation_with_retrieval(candidate_task, validation_result)
+				raise TaskValidationError(validation_result)
 		try:
 			owner.edit_task(task_id, **changes)
 		except TaskValidationError as exc:
-			pet_id = owner.task_to_pet.get(task_id)
-			original_pet = owner._get_pet_by_id(pet_id) if pet_id is not None else None
-			candidate_task = None
-			if original_pet is not None:
-				for existing_task in original_pet.tasks:
-					if existing_task.task_id == task_id:
-						candidate_task = replace(existing_task)
-						for field_name, field_value in changes.items():
-							setattr(candidate_task, field_name, field_value)
-						break
-			if candidate_task is not None and pet_id is not None:
-				self._augment_task_validation_result(owner, pet_id, candidate_task, exc.result)
+			if candidate_task is not None:
+				agent.augment_validation_with_retrieval(candidate_task, exc.result)
 			raise TaskValidationError(exc.result) from None
 		return ValidationResult(status="pass")
 

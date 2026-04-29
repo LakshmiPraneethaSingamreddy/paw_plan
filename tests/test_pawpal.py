@@ -1,23 +1,39 @@
+import importlib
 from datetime import date, datetime, time, timedelta
+import sys
+import types
 from uuid import uuid4
 
 import pytest
 
 from pawpal_system import (
+	AgentRole,
 	AvailabilityWindow,
 	CareTask,
 	ConstraintType,
 	DailySchedule,
+	DETERMINISTIC_FALLBACK_POLICY,
+	DeterministicExplanationAgent,
 	Frequency,
+	HARD_CONSTRAINT_RULES,
+	LocalRetrievalCorpus,
 	Owner,
 	OwnerPreference,
 	Pet,
 	PetCareApp,
+	PlanExplanation,
+	RetrievalSnippet,
 	ScheduleItem,
 	ScheduleStatus,
 	SchedulingConstraint,
+	SCHEDULE_SOURCE_OF_TRUTH,
+	ScheduleCandidate,
+	SchedulerAgentOutput,
 	TaskCategory,
 	TaskValidationError,
+	ValidationResult,
+	ValidationViolation,
+	ViolationSeverity,
 )
 
 
@@ -35,6 +51,133 @@ def _build_owner_with_pet(app: PetCareApp):
 	pet = Pet(name="Buddy", species="Dog", age_years=4, weight_kg=24.0)
 	app.save_pet_info(owner.owner_id, pet)
 	return owner, pet, today
+
+
+class _FakeSessionState(dict):
+	def __getattr__(self, name):
+		try:
+			return self[name]
+		except KeyError as exc:
+			raise AttributeError(name) from exc
+
+	def __setattr__(self, name, value):
+		self[name] = value
+
+
+class _FakeColumn:
+	def __enter__(self):
+		return self
+
+	def __exit__(self, exc_type, exc, tb):
+		return False
+
+
+class _FakeStreamlit(types.ModuleType):
+	def __init__(self):
+		super().__init__("streamlit")
+		self.session_state = _FakeSessionState()
+		self.calls: list[tuple[str, tuple, dict]] = []
+
+	def _record(self, name: str, *args, **kwargs):
+		self.calls.append((name, args, kwargs))
+
+	def set_page_config(self, *args, **kwargs):
+		self._record("set_page_config", *args, **kwargs)
+
+	def markdown(self, *args, **kwargs):
+		self._record("markdown", *args, **kwargs)
+
+	def divider(self, *args, **kwargs):
+		self._record("divider", *args, **kwargs)
+
+	def subheader(self, *args, **kwargs):
+		self._record("subheader", *args, **kwargs)
+
+	def text_input(self, label, value="", **kwargs):
+		self._record("text_input", label, value, **kwargs)
+		return value
+
+	def number_input(self, label, value=0, **kwargs):
+		self._record("number_input", label, value, **kwargs)
+		return value
+
+	def checkbox(self, label, value=False, **kwargs):
+		self._record("checkbox", label, value, **kwargs)
+		return value
+
+	def multiselect(self, label, options, default=None, **kwargs):
+		self._record("multiselect", label, options, default, **kwargs)
+		return list(default or [])
+
+	def time_input(self, label, value=None, **kwargs):
+		self._record("time_input", label, value, **kwargs)
+		return value
+
+	def date_input(self, label, value=None, **kwargs):
+		self._record("date_input", label, value, **kwargs)
+		return value
+
+	def selectbox(self, label, options, index=0, **kwargs):
+		self._record("selectbox", label, options, index, **kwargs)
+		if not options:
+			return None
+		if index is None:
+			return options[0]
+		if isinstance(index, int):
+			return options[min(index, len(options) - 1)]
+		return options[0]
+
+	def button(self, label, **kwargs):
+		self._record("button", label, **kwargs)
+		return False
+
+	def columns(self, specs, **kwargs):
+		self._record("columns", specs, **kwargs)
+		count = specs if isinstance(specs, int) else len(specs)
+		return [_FakeColumn() for _ in range(count)]
+
+	def write(self, *args, **kwargs):
+		self._record("write", *args, **kwargs)
+
+	def success(self, *args, **kwargs):
+		self._record("success", *args, **kwargs)
+
+	def error(self, *args, **kwargs):
+		self._record("error", *args, **kwargs)
+
+	def info(self, *args, **kwargs):
+		self._record("info", *args, **kwargs)
+
+	def warning(self, *args, **kwargs):
+		self._record("warning", *args, **kwargs)
+
+	def caption(self, *args, **kwargs):
+		self._record("caption", *args, **kwargs)
+
+	def table(self, *args, **kwargs):
+		self._record("table", *args, **kwargs)
+
+	def rerun(self, *args, **kwargs):
+		self._record("rerun", *args, **kwargs)
+
+	def text_area(self, label, value="", **kwargs):
+		self._record("text_area", label, value, **kwargs)
+		return value
+
+	def __getattr__(self, name):
+		def _noop(*args, **kwargs):
+			self._record(name, *args, **kwargs)
+			return None
+
+		return _noop
+
+
+def _load_app_module_with_fake_streamlit(monkeypatch):
+	fake_streamlit = _FakeStreamlit()
+	monkeypatch.setitem(sys.modules, "streamlit", fake_streamlit)
+	sys.modules.pop("app", None)
+	module = importlib.import_module("app")
+	return module, fake_streamlit
 
 
 # Verifies marking a scheduled task as complete updates completion fields.
@@ -658,112 +801,108 @@ def test_scheduler_returns_empty_when_no_availability_windows():
 	)
 
 
-# Verifies weekly recurrence now requires an explicit weekday and rejects missing values.
-def test_weekly_task_without_weekday_is_rejected_by_guardrails():
+# Verifies weekly task with missing weekday is auto-repaired to task creation day.
+def test_weekly_task_without_weekday_is_auto_repaired():
 	app = PetCareApp()
 	owner, pet, today = _build_owner_with_pet(app)
 
-	with pytest.raises(TaskValidationError) as exc_info:
-		owner.add_task(
-			pet.pet_id,
-			CareTask(
-				title="Weekly fallback grooming",
-				category=TaskCategory.GROOMING,
-				duration_min=20,
-				priority=2,
-				frequency=Frequency.WEEKLY,
-				weekly_day_of_week=None,
-				earliest_start=time(hour=8, minute=0),
-				latest_end=time(hour=12, minute=0),
-			),
-		)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Weekly fallback grooming",
+			category=TaskCategory.GROOMING,
+			duration_min=20,
+			priority=2,
+			frequency=Frequency.WEEKLY,
+			weekly_day_of_week=None,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=12, minute=0),
+		),
+	)
 
-	assert len(pet.tasks) == 0
-	assert any(v.code == "INCOHERENT_RECURRENCE_WEEKLY_DAY" for v in exc_info.value.result.violations)
+	assert len(pet.tasks) == 1
+	assert pet.tasks[0].weekly_day_of_week == today.weekday()
 
 
-# Verifies custom interval recurrence requires an anchor date in Phase 2.
-def test_custom_interval_without_anchor_is_rejected_by_guardrails():
+# Verifies custom interval task missing anchor date is auto-repaired to task creation date.
+def test_custom_interval_without_anchor_is_auto_repaired():
 	app = PetCareApp()
 	owner, pet, today = _build_owner_with_pet(app)
 
-	with pytest.raises(TaskValidationError) as exc_info:
-		owner.add_task(
-			pet.pet_id,
-			CareTask(
-				title="Custom no-anchor meds",
-				category=TaskCategory.MEDICATION,
-				duration_min=10,
-				priority=2,
-				frequency=Frequency.CUSTOM,
-				custom_interval_days=2,
-				custom_anchor_date=None,
-				earliest_start=time(hour=9, minute=0),
-				latest_end=time(hour=11, minute=0),
-			),
-		)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Custom no-anchor meds",
+			category=TaskCategory.MEDICATION,
+			duration_min=10,
+			priority=2,
+			frequency=Frequency.CUSTOM,
+			custom_interval_days=2,
+			custom_anchor_date=None,
+			earliest_start=time(hour=9, minute=0),
+			latest_end=time(hour=11, minute=0),
+		),
+	)
 
-	assert len(pet.tasks) == 0
-	assert any(v.code == "INCOHERENT_RECURRENCE_CUSTOM_ANCHOR" for v in exc_info.value.result.violations)
+	assert len(pet.tasks) == 1
+	assert pet.tasks[0].custom_anchor_date == today
 
 
-# Verifies non-positive custom intervals are rejected before persistence.
-def test_custom_interval_non_positive_is_rejected_by_guardrails():
+# Verifies non-positive custom intervals are auto-repaired to 1 before persistence.
+def test_custom_interval_non_positive_is_auto_repaired():
 	app = PetCareApp()
 	owner, pet, today = _build_owner_with_pet(app)
 
-	with pytest.raises(TaskValidationError) as exc_info:
-		owner.add_task(
-			pet.pet_id,
-			CareTask(
-				title="Broken interval task",
-				category=TaskCategory.MEDICATION,
-				duration_min=10,
-				priority=2,
-				frequency=Frequency.CUSTOM,
-				custom_interval_days=0,
-				custom_anchor_date=today,
-				earliest_start=time(hour=9, minute=0),
-				latest_end=time(hour=11, minute=0),
-			),
-		)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Broken interval task",
+			category=TaskCategory.MEDICATION,
+			duration_min=10,
+			priority=2,
+			frequency=Frequency.CUSTOM,
+			custom_interval_days=0,
+			custom_anchor_date=today,
+			earliest_start=time(hour=9, minute=0),
+			latest_end=time(hour=11, minute=0),
+		),
+	)
 
-	assert len(pet.tasks) == 0
-	assert any(v.code == "INCOHERENT_RECURRENCE_CUSTOM_INTERVAL" for v in exc_info.value.result.violations)
+	assert len(pet.tasks) == 1
+	assert pet.tasks[0].custom_interval_days == 1
 
 
-# Verifies zero/negative durations are rejected before persistence.
-def test_scheduler_rejects_zero_or_negative_duration_tasks():
+# Verifies zero/negative durations are auto-repaired to the default minimum before persistence.
+def test_scheduler_auto_repairs_zero_or_negative_duration_tasks():
 	app = PetCareApp()
 	owner, pet, today = _build_owner_with_pet(app)
 
-	with pytest.raises(TaskValidationError):
-		owner.add_task(
-			pet.pet_id,
-			CareTask(
-				title="Zero duration task",
-				category=TaskCategory.FEEDING,
-				duration_min=0,
-				priority=3,
-				earliest_start=time(hour=8, minute=0),
-				latest_end=time(hour=9, minute=0),
-			),
-		)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Zero duration task",
+			category=TaskCategory.FEEDING,
+			duration_min=0,
+			priority=3,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=9, minute=0),
+		),
+	)
 
-	with pytest.raises(TaskValidationError):
-		owner.add_task(
-			pet.pet_id,
-			CareTask(
-				title="Negative duration task",
-				category=TaskCategory.PLAY,
-				duration_min=-10,
-				priority=3,
-				earliest_start=time(hour=9, minute=0),
-				latest_end=time(hour=10, minute=0),
-			),
-		)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Negative duration task",
+			category=TaskCategory.PLAY,
+			duration_min=-10,
+			priority=3,
+			earliest_start=time(hour=9, minute=0),
+			latest_end=time(hour=10, minute=0),
+		),
+	)
 
-	assert len(pet.tasks) == 0
+	assert len(pet.tasks) == 2
+	assert all(t.duration_min == 15 for t in pet.tasks)
 
 
 # Verifies deterministic ordering for tasks with identical priority and time windows.
@@ -1111,3 +1250,428 @@ def test_flexible_tasks_can_overflow_past_deadline_assertive():
 		if item.task and not item.task.is_flexible and item.task.latest_end is not None:
 			assert item.end_time is not None
 			assert item.end_time.time() <= item.task.latest_end
+
+
+def test_phase8_agent_handoff_contract_keeps_scheduler_advisory_only_and_retrieval_hinted():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+	owner.preference = OwnerPreference(
+		max_tasks_per_block=3,
+		preferred_task_order="feeding, walk, play",
+		avoid_late_night=True,
+		notification_lead_min=20,
+	)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Breakfast",
+			category=TaskCategory.FEEDING,
+			duration_min=20,
+			priority=3,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=9, minute=0),
+		),
+	)
+
+	context = app._build_planning_context(owner.owner_id, owner, today)
+	candidate, baseline_schedule, duration_ms = app._run_scheduler_agent_wrapper(context)
+
+	assert candidate.generated_by == AgentRole.SCHEDULER
+	assert candidate.advisory_only is True
+	assert candidate.rationale_metadata["source_of_truth"] == SCHEDULE_SOURCE_OF_TRUTH
+	assert candidate.rationale_metadata["fallback_policy"] == DETERMINISTIC_FALLBACK_POLICY
+	assert candidate.rationale_metadata["hard_constraint_rules"] == list(HARD_CONSTRAINT_RULES)
+	assert candidate.reason_codes == tuple(baseline_schedule.planning_metadata.get("reason_codes", []))
+	assert baseline_schedule.planning_metadata["retrieval_hint_count"] > 0
+	assert duration_ms >= 0
+
+
+def test_phase8_guardrail_rejection_returns_actionable_repair_hints():
+	app = PetCareApp()
+	owner, pet, _today = _build_owner_with_pet(app)
+
+	walk = CareTask(
+		title="Morning Walk",
+		category=TaskCategory.WALKING,
+		duration_min=30,
+		priority=3,
+		earliest_start=time(hour=7, minute=0),
+		latest_end=time(hour=9, minute=0),
+	)
+	owner.add_task(pet.pet_id, walk)
+
+	# Exact duplicate triggers DUPLICATE_TASK (non-repairable) so still raises.
+	with pytest.raises(TaskValidationError) as exc_info:
+		app.add_task(
+			owner.owner_id,
+			pet.pet_id,
+			CareTask(
+				title="Morning Walk",
+				category=TaskCategory.WALKING,
+				duration_min=30,
+				priority=3,
+				earliest_start=time(hour=7, minute=0),
+				latest_end=time(hour=9, minute=0),
+			),
+		)
+
+	result = exc_info.value.result
+	assert len(pet.tasks) == 1
+	assert any(violation.code == "DUPLICATE_TASK" for violation in result.violations)
+	assert any(hint.startswith("Retrieved correction hint from") for hint in result.repair_hints)
+	assert any(hint.startswith("Normalization suggestion from retrieval:") for hint in result.repair_hints)
+	assert any("align this task with" in hint for hint in result.repair_hints)
+
+
+def test_phase8_self_check_converges_after_single_retry(monkeypatch):
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Retryable feed",
+			category=TaskCategory.FEEDING,
+			duration_min=15,
+			priority=3,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=9, minute=0),
+		),
+	)
+
+	state = {"calls": 0}
+
+	def flaky_validator(*_args, **_kwargs):
+		state["calls"] += 1
+		if state["calls"] == 1:
+			result = ValidationResult(status="fail")
+			result.add_violation(
+				ValidationViolation(
+					code="TRANSIENT_PHASE8_FAILURE",
+					message="Synthetic transient failure.",
+					severity=ViolationSeverity.MEDIUM,
+					repair_hint="Retry once.",
+				)
+			)
+			return result
+		return ValidationResult(status="pass")
+
+	monkeypatch.setattr(sys.modules["pawpal_system"], "validate_schedule_candidate", flaky_validator)
+
+	schedule = app.run_daily_planning(owner.owner_id, today)
+	key = (owner.owner_id, today)
+
+	assert schedule.items
+	assert len(app.planning_telemetry_by_owner_date[key]) == 2
+	assert all(not telemetry.used_deterministic_fallback for telemetry in app.planning_telemetry_by_owner_date[key])
+	assert any("retry scheduled" in entry.lower() for entry in app.planning_logs_by_owner_date[key])
+	assert any("passed validation" in entry.lower() for entry in app.planning_logs_by_owner_date[key])
+	assert app.planning_loop_diagnostics_by_owner_date[key][0].validation_status == "fail"
+
+
+def test_phase8_self_check_triggers_deterministic_fallback(monkeypatch):
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Fallback walk",
+			category=TaskCategory.WALKING,
+			duration_min=20,
+			priority=3,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=10, minute=0),
+		),
+	)
+
+	def always_fail_validator(*_args, **_kwargs):
+		result = ValidationResult(status="fail")
+		result.add_violation(
+			ValidationViolation(
+				code="UNRECOVERABLE_PHASE8_FAILURE",
+				message="Synthetic critical failure.",
+				severity=ViolationSeverity.CRITICAL,
+				repair_hint="Do not retry.",
+			)
+		)
+		return result
+
+	monkeypatch.setattr(sys.modules["pawpal_system"], "validate_schedule_candidate", always_fail_validator)
+
+	schedule = app.run_daily_planning(owner.owner_id, today)
+	key = (owner.owner_id, today)
+
+	assert schedule.items
+	assert len(app.planning_telemetry_by_owner_date[key]) == 1
+	assert app.planning_telemetry_by_owner_date[key][0].used_deterministic_fallback is True
+	assert app.planning_telemetry_by_owner_date[key][0].fallback_reason == "stop_condition_triggered"
+	assert any("deterministic fallback triggered" in entry.lower() for entry in app.planning_logs_by_owner_date[key])
+
+
+def test_phase8_explanation_groundedness_requires_supported_claims_and_all_attributions():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+	owner.preference = OwnerPreference(
+		max_tasks_per_block=2,
+		preferred_task_order="feeding, walk, play",
+		avoid_late_night=True,
+		notification_lead_min=15,
+	)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Breakfast",
+			category=TaskCategory.FEEDING,
+			duration_min=20,
+			priority=3,
+			frequency=Frequency.DAILY,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=9, minute=0),
+			is_flexible=False,
+		),
+	)
+
+	schedule = app.run_daily_planning(owner.owner_id, today)
+	context = app._build_planning_context(owner.owner_id, owner, today)
+	agent = DeterministicExplanationAgent()
+	retrieved_snippets = app._retrieve_context_snippets(
+		owner=owner,
+		schedule_date=today,
+		query="hard constraints source of truth fallback breakfast",
+		top_k=3,
+	)
+
+	assert len(retrieved_snippets) >= 2
+	good_message = (
+		f"Retrieved context for {today.isoformat()} supports the plan. Sources: "
+		+ "; ".join(f"[{snippet.attribution}] {snippet.content}" for snippet in retrieved_snippets)
+		+ "."
+	)
+	good = PlanExplanation(
+		message=good_message,
+		rule_applied="phase6_retrieved_context",
+		impact_score=0.95,
+	)
+	assert agent._passes_groundedness_guardrails(
+		good,
+		schedule=schedule,
+		context=context,
+		retrieved_snippets=retrieved_snippets,
+	)
+
+	bad = PlanExplanation(
+		message=(
+			f"Retrieved context for {today.isoformat()} is the best schedule ever. Sources: "
+			f"[{retrieved_snippets[0].attribution}] {retrieved_snippets[0].content}."
+		),
+		rule_applied="phase6_retrieved_context",
+		impact_score=0.95,
+	)
+	assert agent._passes_groundedness_guardrails(
+		bad,
+		schedule=schedule,
+		context=context,
+		retrieved_snippets=retrieved_snippets,
+	) is False
+
+
+def test_phase8_rag_retrieval_preserves_relevance_and_attribution():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+	owner.preference = OwnerPreference(
+		max_tasks_per_block=2,
+		preferred_task_order="breakfast, walk",
+		avoid_late_night=False,
+		notification_lead_min=15,
+	)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Breakfast",
+			category=TaskCategory.FEEDING,
+			duration_min=20,
+			priority=3,
+			frequency=Frequency.DAILY,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=9, minute=0),
+			is_flexible=False,
+		),
+	)
+
+	context = app._build_planning_context(owner.owner_id, owner, today)
+	candidate, baseline_schedule, _duration_ms = app._run_scheduler_agent_wrapper(context)
+	retrieved_snippets = app._retrieve_context_snippets(
+		owner=owner,
+		schedule_date=today,
+		query="Breakfast preferred task order hard constraints",
+		top_k=3,
+	)
+	agent = DeterministicExplanationAgent()
+	explanations = agent.expand_explanations(
+		context=context,
+		candidate=candidate,
+		schedule=baseline_schedule,
+		retrieved_snippets=retrieved_snippets,
+	)
+	retrieved_context_explanations = [explanation for explanation in explanations if explanation.rule_applied == "phase6_retrieved_context"]
+
+	assert retrieved_snippets
+	assert retrieved_snippets[0].source_type in {"owner_preference", "routine", "policy"}
+	assert "Breakfast" in retrieved_snippets[0].content or "preferred_task_order" in retrieved_snippets[0].content
+	assert any(snippet.attribution.startswith("policy:") for snippet in retrieved_snippets)
+	assert retrieved_context_explanations
+	assert all(snippet.attribution in retrieved_context_explanations[0].message for snippet in retrieved_snippets)
+
+
+def test_phase8_same_inputs_produce_same_schedule_projection():
+	def _build_projection(app: PetCareApp):
+		owner, pet, today = _build_owner_with_pet(app)
+		owner.preference = OwnerPreference(
+			max_tasks_per_block=2,
+			preferred_task_order="feeding, walk, play",
+			avoid_late_night=True,
+			notification_lead_min=15,
+		)
+		owner.add_task(
+			pet.pet_id,
+			CareTask(
+				title="Breakfast",
+				category=TaskCategory.FEEDING,
+				duration_min=20,
+				priority=3,
+				frequency=Frequency.DAILY,
+				earliest_start=time(hour=8, minute=0),
+				latest_end=time(hour=9, minute=0),
+				is_flexible=False,
+			),
+		)
+		owner.add_task(
+			pet.pet_id,
+			CareTask(
+				title="Morning walk",
+				category=TaskCategory.WALKING,
+				duration_min=30,
+				priority=2,
+				frequency=Frequency.DAILY,
+				earliest_start=time(hour=8, minute=30),
+				latest_end=time(hour=10, minute=0),
+				is_flexible=True,
+			),
+		)
+		schedule = app.run_daily_planning(owner.owner_id, today)
+		return {
+			"items": [
+				(
+					item.task.title if item.task else None,
+					item.start_time,
+					item.end_time,
+					item.reason_code,
+					item.completed,
+				)
+				for item in schedule.items
+			],
+			"explanations": [(explanation.rule_applied, explanation.message) for explanation in schedule.explanations],
+			"metadata": {
+				key: schedule.planning_metadata.get(key)
+				for key in (
+					"strategy",
+					"ordering_policy",
+					"scheduled_count",
+					"unscheduled_count",
+					"reason_codes",
+					"retrieval_hint_count",
+					"phase5_repair_strategy",
+					"phase5_repair_detail",
+				)
+			},
+		}
+
+	projection_one = _build_projection(PetCareApp())
+	projection_two = _build_projection(PetCareApp())
+
+	assert projection_one == projection_two
+
+
+def test_phase8_ui_smoke_helpers_render_guardrails_explanations_and_warnings(monkeypatch):
+	app_module, fake_streamlit = _load_app_module_with_fake_streamlit(monkeypatch)
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Breakfast",
+			category=TaskCategory.FEEDING,
+			duration_min=20,
+			priority=3,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=9, minute=0),
+		),
+	)
+
+	# Exact duplicate of "Breakfast" triggers DUPLICATE_TASK (non-repairable).
+	with pytest.raises(TaskValidationError) as exc_info:
+		app.add_task(
+			owner.owner_id,
+			pet.pet_id,
+			CareTask(
+				title="Breakfast",
+				category=TaskCategory.FEEDING,
+				duration_min=20,
+				priority=3,
+				earliest_start=time(hour=8, minute=0),
+				latest_end=time(hour=9, minute=0),
+			),
+		)
+
+	fake_streamlit.calls.clear()
+	app_module._show_task_guardrail_feedback(exc_info.value)
+	assert any(name == "error" and "validation guardrails failed" in args[0].lower() for name, args, _kwargs in fake_streamlit.calls)
+	assert any(name == "write" and "DUPLICATE_TASK" in args[0] for name, args, _kwargs in fake_streamlit.calls if args)
+	assert any(name == "info" and args[0] == "Suggested fixes:" for name, args, _kwargs in fake_streamlit.calls)
+
+	schedule = app.run_daily_planning(owner.owner_id, today)
+	assert app_module._build_plan_explanation_lines(schedule)
+	assert all(line.startswith("- ") for line in app_module._build_plan_explanation_lines(schedule))
+
+	conflict_start = datetime.combine(today, time(hour=9, minute=0))
+	conflict_end = datetime.combine(today, time(hour=9, minute=30))
+	conflict_schedule = DailySchedule(
+		date=today,
+		items=[
+			ScheduleItem(
+				start_time=conflict_start,
+				end_time=conflict_end,
+				reason_code="TEST_CONFLICT_ONE",
+				task=CareTask(title="One", category=TaskCategory.FEEDING, duration_min=30, priority=2),
+			),
+			ScheduleItem(
+				start_time=datetime.combine(today, time(hour=9, minute=15)),
+				end_time=datetime.combine(today, time(hour=9, minute=45)),
+				reason_code="TEST_CONFLICT_TWO",
+				task=CareTask(title="Two", category=TaskCategory.WALKING, duration_min=30, priority=1),
+			),
+		],
+	)
+	conflicts = app_module._get_schedule_conflicts(conflict_schedule)
+	warning_messages = app_module._build_schedule_warning_messages(conflict_schedule, conflicts=conflicts)
+	assert warning_messages
+	assert warning_messages[0].startswith("Detected 1 schedule conflict(s)")
+
+	empty_schedule = DailySchedule(
+		date=today,
+		explanations=[
+			PlanExplanation(
+				message="No availability is configured for the selected day.",
+				rule_applied="availability_required",
+				impact_score=1.0,
+			)
+		],
+	)
+	assert app_module._build_schedule_warning_messages(empty_schedule) == [
+		"No availability is configured for the selected day. Add an availability window for that weekday and try again."
+	]

@@ -341,12 +341,51 @@ selected_task_frequency = Frequency[task_frequency]
 def _show_task_guardrail_feedback(error: TaskValidationError) -> None:
     """Render task validation violations and repair hints in a compact UI block."""
     st.error("Task was not saved because validation guardrails failed.")
-    for violation in error.result.violations:
-        st.write(f"- {violation.code}: {violation.message}")
-    if error.result.repair_hints:
+    for line in _build_task_guardrail_feedback_lines(error):
+        st.write(line)
+    retrieval_hints = [
+        h for h in error.result.repair_hints
+        if h.startswith("Normalization suggestion from retrieval:")
+        or h.startswith("Retrieved correction hint from routine:")
+    ]
+    if retrieval_hints:
         st.info("Suggested fixes:")
-        for hint in error.result.repair_hints:
+        for hint in retrieval_hints:
             st.write(f"- {hint}")
+
+
+def _build_task_guardrail_feedback_lines(error: TaskValidationError) -> list[str]:
+    """Return the violation lines shown in the task guardrail UI."""
+    return [f"- {violation.code}: {violation.message}" for violation in error.result.violations]
+
+
+def _build_schedule_warning_messages(schedule, conflicts=None) -> list[str]:
+    """Return warning text for schedule generation and conflict displays."""
+    warnings: list[str] = []
+    if conflicts:
+        warnings.append(
+            f"Detected {len(conflicts)} schedule conflict(s). Focus on moving flexible tasks first to reduce overlap."
+        )
+
+    if getattr(schedule, "items", None):
+        return warnings
+
+    has_no_day_availability = any(
+        explanation.rule_applied == "availability_required"
+        for explanation in getattr(schedule, "explanations", [])
+    )
+    if has_no_day_availability:
+        warnings.append(
+            "No availability is configured for the selected day. Add an availability window for that weekday and try again."
+        )
+    else:
+        warnings.append("No tasks could be scheduled. Check pet tasks and owner availability.")
+    return warnings
+
+
+def _build_plan_explanation_lines(schedule) -> list[str]:
+    """Return display-ready explanation lines for the plan summary."""
+    return [f"- {explanation.message}" for explanation in getattr(schedule, "explanations", [])]
 
 if st.button("Add task"):
     target_pet_id = selected_pet_id or st.session_state.pet_id
@@ -715,7 +754,6 @@ else:
 st.divider()
 
 st.subheader("Build Schedule")
-st.caption("This button should call your scheduling logic once you implement it.")
 
 schedule_date = st.date_input("Schedule date", value=date.today())
 
@@ -740,27 +778,22 @@ if st.button("Generate schedule"):
         st.session_state.last_schedule = schedule
         st.session_state.last_schedule_date = schedule_date
 
+        # Clear any cached AI explanation when a new schedule is generated.
+        enhance_key = f"llm_expl_{st.session_state.owner_id}_{schedule_date.isoformat()}"
+        if enhance_key in st.session_state:
+            del st.session_state[enhance_key]
+
         if schedule.items:
             conflicts = _get_schedule_conflicts(schedule)
             st.success(
                 f"Schedule generated for {schedule_date.isoformat()}: "
                 f"{len(schedule.items)} task(s) planned."
             )
-            if conflicts:
-                st.warning(
-                    f"{len(conflicts)} conflict(s) detected. Review the conflict table below to adjust overlapping tasks."
-                )
+            for warning_message in _build_schedule_warning_messages(schedule, conflicts=conflicts):
+                st.warning(warning_message)
         else:
-            has_no_day_availability = any(
-                explanation.rule_applied == "availability_required"
-                for explanation in schedule.explanations
-            )
-            if has_no_day_availability:
-                st.warning(
-                    "No availability is configured for the selected day. Add an availability window for that weekday and try again."
-                )
-            else:
-                st.warning("No tasks could be scheduled. Check pet tasks and owner availability.")
+            for warning_message in _build_schedule_warning_messages(schedule):
+                st.warning(warning_message)
 
 # Display persisted schedule (either from fresh generation or from session state across reruns)
 if hasattr(st.session_state, 'last_schedule') and st.session_state.last_schedule is not None:
@@ -838,11 +871,9 @@ if hasattr(st.session_state, 'last_schedule') and st.session_state.last_schedule
 
         # Read-only conflict detection via scheduler service helper.
         conflicts = _get_schedule_conflicts(schedule)
-
+        for warning_message in _build_schedule_warning_messages(schedule, conflicts=conflicts):
+            st.warning(warning_message)
         if conflicts:
-            st.warning(
-                f"Detected {len(conflicts)} schedule conflict(s). Focus on moving flexible tasks first to reduce overlap."
-            )
             st.markdown("### Conflict details")
             conflict_rows = []
             for previous_item, current_item in conflicts:
@@ -879,6 +910,102 @@ if hasattr(st.session_state, 'last_schedule') and st.session_state.last_schedule
             )
 
         if schedule.explanations:
-            st.markdown("### Plan explanation")
-            for explanation in schedule.explanations:
-                st.write(f"- {explanation.message}")
+            from llm_config import get_llm_config
+            enhance_key = f"llm_expl_{st.session_state.owner_id}_{schedule_date.isoformat()}"
+            enhanced_text = st.session_state.get(enhance_key)
+
+            # Header row: title on the left, AI button on the right
+            header_left, header_right = st.columns([3, 1])
+            with header_left:
+                st.markdown("### Plan explanation")
+            with header_right:
+                if enhanced_text:
+                    if st.button("Clear AI summary", key=f"clear_{enhance_key}"):
+                        del st.session_state[enhance_key]
+                        st.rerun()
+                elif get_llm_config().is_valid():
+                    if st.button("✨ Explain with AI", key=f"btn_{enhance_key}"):
+                        from llm_agents import LLMExplanationAgent
+                        raw_lines = _build_plan_explanation_lines(schedule)
+                        with st.spinner("Generating AI explanation..."):
+                            agent = LLMExplanationAgent()
+                            enhanced = agent.enhance_explanations_text(
+                                [line.lstrip("- ") for line in raw_lines]
+                            )
+                        if enhanced:
+                            st.session_state[enhance_key] = enhanced
+                            st.rerun()
+                        else:
+                            cfg = get_llm_config()
+                            st.warning(
+                                f"AI explanation call failed (model: `{cfg.explanation_model}`). "
+                                "Check your OPENAI_API_KEY and that LLM_EXPLANATION_MODEL is a valid model name."
+                            )
+
+            if enhanced_text:
+                st.info(enhanced_text)
+                st.caption(f"✨ Rewritten by AI · {get_llm_config().explanation_model}")
+            else:
+                raw_lines = _build_plan_explanation_lines(schedule)
+                for explanation_line in raw_lines:
+                    st.write(explanation_line)
+
+        # --- Orchestration diagnostics ---
+        telemetry_key = (st.session_state.owner_id, schedule_date)
+        app = st.session_state.petcare_app
+        telemetry_entries = app.planning_telemetry_by_owner_date.get(telemetry_key, [])
+        loop_logs = app.planning_logs_by_owner_date.get(telemetry_key, [])
+        diagnostics = app.planning_loop_diagnostics_by_owner_date.get(telemetry_key, [])
+
+        with st.expander("Scheduler diagnostics", expanded=False):
+            st.caption(
+                "Shows what the scheduling engine did internally: how many attempts it made, "
+                "whether any repair strategies ran, and whether it fell back to the rule-based scheduler."
+            )
+
+            if not telemetry_entries:
+                st.info("No orchestration data for this schedule yet. Generate a schedule first.")
+            else:
+                # Summary row
+                total_attempts = len(telemetry_entries)
+                any_fallback = any(t.used_deterministic_fallback for t in telemetry_entries)
+                total_retries = sum(t.retries for t in telemetry_entries)
+                total_ms = sum(t.duration_ms for t in telemetry_entries)
+
+                summary_cols = st.columns(4)
+                summary_cols[0].metric("Attempts", total_attempts)
+                summary_cols[1].metric("Retries", total_retries)
+                summary_cols[2].metric("Total time (ms)", total_ms)
+                summary_cols[3].metric("Fallback used", "Yes" if any_fallback else "No")
+
+                if any_fallback:
+                    st.warning(
+                        "The AI scheduler could not produce a valid schedule within the retry budget. "
+                        "The final schedule was built by the rule-based fallback scheduler."
+                    )
+                else:
+                    st.success("The AI scheduler produced a valid schedule without needing the fallback.")
+
+                # Per-attempt diagnostics table
+                if diagnostics:
+                    st.markdown("#### Per-attempt detail")
+                    diag_rows = []
+                    for d in diagnostics:
+                        diag_rows.append(
+                            {
+                                "Attempt": d.attempt,
+                                "Stage": d.stage,
+                                "Validation": d.validation_status,
+                                "Violations": ", ".join(d.violation_codes) if d.violation_codes else "none",
+                                "Repair strategy": d.repair_strategy or "—",
+                                "After repair": d.repaired_validation_status or "—",
+                                "Fallback": "Yes" if d.fallback_used else "No",
+                                "Detail": d.detail,
+                            }
+                        )
+                    st.dataframe(diag_rows, use_container_width=True)
+
+                # Step-by-step loop log
+                if loop_logs:
+                    st.markdown("#### Step-by-step loop log")
+                    st.code("\n".join(loop_logs), language=None)
